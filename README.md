@@ -169,3 +169,6 @@ MIT License
 - If results seem inconsistent, increase the `--iterations` parameter
 - For the most accurate results, close other applications and minimize system activity during testing
 - On systems with NUMA architecture, results may vary depending on memory allocation across nodes
+
+  Maintained by Kyle Fox
+  
