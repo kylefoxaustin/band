@@ -1,174 +1,188 @@
-# DDR Bandwidth Measurement Tool
+# BAND: Bandwidth Assessment for NumPy and DDR
 
-A cross-platform tool for measuring and estimating DDR memory bandwidth on both x86/AMD64 and ARM64 systems running Linux (tested on Ubuntu 22.04).
+![Python](https://img.shields.io/badge/python-3.6+-blue.svg)
+![License](https://img.shields.io/badge/license-MIT-green.svg)
 
-## Overview
+## Introduction
 
-This tool performs a series of memory operations to estimate the available DDR bandwidth on your system. It measures:
+BAND (Bandwidth Assessment for NumPy and DDR) is a Python-based memory bandwidth measurement tool designed to provide results comparable to the industry-standard STREAM benchmark. It offers optimized implementations for various memory operations with a focus on performance, allowing Python developers to evaluate memory bandwidth in their environments.
 
-- Sequential read bandwidth
-- Sequential write bandwidth
-- Sequential copy bandwidth
-- Random read bandwidth
-- Strided read bandwidth
+## Why BAND was Created
 
-The results are combined to provide an overall estimate of your system's DDR bandwidth with an expected accuracy of ±15%.
+Traditional memory bandwidth benchmarks like STREAM are written in C and require compilation for each platform. BAND was created to provide an easy-to-use Python alternative that:
 
-## Features
+1. Requires no compilation step (just Python + NumPy)
+2. Produces results comparable to the C-based STREAM benchmark
+3. Provides multiple optimized implementations to explore memory bandwidth characteristics
+4. Offers a simple, cross-platform way to estimate DDR memory bandwidth
+5. Helps Python developers understand memory performance constraints in data-intensive applications
 
-- Multi-threaded testing to maximize bandwidth utilization
-- Multiple test patterns to simulate different memory access scenarios
-- Statistical analysis (min, max, mean, standard deviation)
-- Works on both x86/AMD64 and ARM64 platforms
-- Compatible with Linux (tested on Ubuntu 22.04)
-- JSON output for further analysis
+BAND is particularly useful for:
+- Data scientists working with large NumPy arrays
+- Python developers optimizing memory-bound applications
+- Performance engineers comparing memory subsystems across platforms
+- System administrators evaluating Python performance on different hardware
 
-## Requirements
+## Getting Started
+
+### Prerequisites
 
 - Python 3.6 or higher
-- NumPy library
-- psutil library
+- NumPy
+- psutil (for system information)
 
-## Installation
-
-1. Install the required Python packages:
+### Installation
 
 ```bash
+# Clone the repository
+git clone https://github.com/kylefoxaustin/band.git
+cd band
+
+# Install required packages
 pip install numpy psutil
+
+# Make the script executable
+chmod +x band.py
 ```
 
-2. Make the script executable:
-
-```bash
-chmod +x ddr_bandwidth.py
-```
-
-## Usage
+## How to Run
 
 Basic usage:
 
 ```bash
-./ddr_bandwidth.py
+./band.py
 ```
 
-Custom configuration:
-
-```bash
-./ddr_bandwidth.py --size 2 --threads 8 --iterations 5 --output results.json
-```
+This will run all tests with default settings (4GB total memory, using up to 4 threads).
 
 ### Command Line Options
 
-- `--size`: Size in GB for each test (default: 1 GB)
-- `--iterations`: Number of iterations per test (default: 3)
-- `--threads`: Number of threads to use (default: min(CPU count, 4))
-- `--output`: Output file for test results in JSON format
-- `--quick`: Run only the most important tests (sequential read/write/copy)
+```bash
+./band.py --size 2.0 --threads 8 --iterations 5
+```
 
-## Example Output
+You can customize the execution with the following options:
 
 ```
-DDR Bandwidth Measurement Tool
--------------------------------
+--size FLOAT           Size in GB for each test (default: 4 GB)
+--iterations INT       Number of iterations per test (default: 3)
+--threads INT          Number of threads (default: min(CPU count, 4))
+--chunk-size INT       Chunk size in KB for operations (default: varies by test)
+--triad-only           Run only the triad tests for optimization experiments
+--best                 Run only the best implementation for each operation
+--compare              Compare to C STREAM benchmark results
+--c-stream-triad FLOAT C STREAM Triad result for comparison (default: 19.98 GB/s)
+```
+
+## Explanation of CLI Options
+
+- **--size**: Total memory size to use for testing. Larger values provide more accurate results but require more RAM. Recommended to use at least 2-4 GB for meaningful results.
+
+- **--iterations**: Number of times each test is run. The first iteration is considered a warm-up and excluded from final results.
+
+- **--threads**: Number of threads to use. Defaults to the minimum of available CPU cores or 4. More threads can help utilize multi-channel memory systems.
+
+- **--chunk-size**: Size of data chunks processed in each iteration, measured in KB. Different chunk sizes can significantly impact performance due to cache effects.
+
+- **--triad-only**: Run only the Triad tests, which combine read, write and arithmetic operations. Useful for focusing on the most comprehensive memory test.
+
+- **--best**: Run only the best implementation for each operation type, which is useful for maximum performance measurement with minimal testing time.
+
+- **--compare**: Enable comparison with C STREAM benchmark results.
+
+- **--c-stream-triad**: Specify your C STREAM Triad result in GB/s for direct comparison.
+
+## Performance Optimization Options
+
+To achieve the best memory bandwidth results, consider trying:
+
+1. **Experiment with thread count** 
+   - Match the number of threads to your CPU's memory channels for optimal results
+   - Try powers of 2: `--threads 1`, `--threads 2`, `--threads 4`, `--threads 8`
+
+2. **Try different chunk sizes**
+   - Smaller chunks (16-128KB) may work better on systems with small caches
+   - Larger chunks (1-8MB) often work better on server-class hardware 
+   - Example: `--chunk-size 512` or `--chunk-size 4096`
+
+3. **Optimize for your workload**
+   - Use `--triad-only` to focus on the most comprehensive test
+   - Compare the standard Triad vs ChunkedTriad implementations
+
+4. **System-level optimizations**
+   - Run with elevated process priority
+   - Disable CPU frequency scaling
+   - Close other memory-intensive applications
+   - Try setting process affinity to specific NUMA nodes if applicable
+
+5. **Memory configurations**
+   - Test with various memory configurations (dual vs. single channel)
+   - Compare DIMM speeds and configurations if possible
+
+## Example Results
+
+```
+BAND: Bandwidth Assessment for NumPy and DDR
+----------------------------------------
 System: Linux x86_64
-Processor: Intel(R) Core(TM) i7-10700K CPU @ 3.80GHz
+Processor: AMD Ryzen 9 5900X 12-Core Processor
 CPU Cores: 16
 Memory: 32.0 GB
-Test Size: 1.0 GB per test
+Test Size: 4.0 GB per test
 Threads: 4
 Iterations: 3
 
-Running Sequential Read test with 4 threads, 1.0 GB total memory...
-  Iteration 1/3... 24.18 GB/s
-  Iteration 2/3... 24.56 GB/s
-  Iteration 3/3... 24.42 GB/s
-  Sequential Read result: 24.39 GB/s (min: 24.18, max: 24.56)
+Running STREAM Copy test with 4 threads, 4.0 GB total memory...
+  Iteration 1/3... 21328.55 GB/s
+  Iteration 2/3... 21356.82 GB/s
+  Iteration 3/3... 21345.67 GB/s
+  STREAM Copy result: 21351.25 GB/s (min: 21345.67, max: 21356.82)
 
-Running Sequential Write test with 4 threads, 1.0 GB total memory...
-  Iteration 1/3... 18.32 GB/s
-  Iteration 2/3... 18.45 GB/s
-  Iteration 3/3... 18.26 GB/s
-  Sequential Write result: 18.34 GB/s (min: 18.26, max: 18.45)
+Running STREAM Scale test with 4 threads, 4.0 GB total memory...
+  Iteration 1/3... 14862.21 GB/s
+  Iteration 2/3... 14891.45 GB/s
+  Iteration 3/3... 14878.33 GB/s
+  STREAM Scale result: 14884.89 GB/s (min: 14862.21, max: 14891.45)
 
-Running Sequential Copy test with 4 threads, 1.0 GB total memory...
-  Iteration 1/3... 16.78 GB/s
-  Iteration 2/3... 16.85 GB/s
-  Iteration 3/3... 16.71 GB/s
-  Sequential Copy result: 16.78 GB/s (min: 16.71, max: 16.85)
+Running STREAM Add test with 4 threads, 4.0 GB total memory...
+  Iteration 1/3... 16345.78 GB/s
+  Iteration 2/3... 16382.12 GB/s
+  Iteration 3/3... 16367.45 GB/s
+  STREAM Add result: 16374.79 GB/s (min: 16345.78, max: 16382.12)
 
-Running Random Read test with 4 threads, 1.0 GB total memory...
-  Iteration 1/3... 5.23 GB/s
-  Iteration 2/3... 5.26 GB/s
-  Iteration 3/3... 5.24 GB/s
-  Random Read result: 5.24 GB/s (min: 5.23, max: 5.26)
+Running STREAM Triad test with 4 threads, 4.0 GB total memory...
+  Iteration 1/3... 16278.34 GB/s
+  Iteration 2/3... 16305.67 GB/s
+  Iteration 3/3... 16297.21 GB/s
+  STREAM Triad result: 16301.44 GB/s (min: 16278.34, max: 16305.67)
 
-Running Strided Read test with 4 threads, 1.0 GB total memory...
-  Iteration 1/3... 9.45 GB/s
-  Iteration 2/3... 9.38 GB/s
-  Iteration 3/3... 9.42 GB/s
-  Strided Read result: 9.42 GB/s (min: 9.38, max: 9.45)
+Running Chunked Triad test with 4 threads, 4.0 GB total memory...
+  Iteration 1/3... 16512.45 GB/s
+  Iteration 2/3... 16567.89 GB/s
+  Iteration 3/3... 16545.32 GB/s
+  Chunked Triad result: 16556.61 GB/s (min: 16512.45, max: 16567.89)
 
 Results Summary
 --------------
-Sequential Read: 24.39 GB/s ±0.16
-Sequential Write: 18.34 GB/s ±0.08
-Sequential Copy: 16.78 GB/s ±0.06
-Random Read: 5.24 GB/s ±0.01
-Strided Read: 9.42 GB/s ±0.03
+STREAM Copy: 21351.25 GB/s
+STREAM Scale: 14884.89 GB/s
+STREAM Add: 16374.79 GB/s
+STREAM Triad: 16301.44 GB/s
+Chunked Triad: 16556.61 GB/s
 
-Estimated DDR Bandwidth: 25.43 GB/s
-Note: Actual bandwidth may be ±15% of this estimate due to OS overhead
+Triad Implementation Comparison (vs STREAM Triad):
+  Chunked Triad: 16556.61 GB/s (+1.6%)
+
+Best Python Triad (Chunked Triad) achieves 82.9% of C STREAM Triad performance
 ```
 
-## Understanding the Results
+## Attestation
 
-The tool provides several bandwidth measurements:
+Maintained by Kyle Fox ([@kylefoxaustin](https://github.com/kylefoxaustin)).
 
-- **Sequential Read**: Measures how quickly data can be read from memory in a sequential pattern
-- **Sequential Write**: Measures how quickly data can be written to memory in a sequential pattern
-- **Sequential Copy**: Measures combined read and write operations when copying memory
-- **Random Read**: Measures memory access performance with random access patterns
-- **Strided Read**: Measures memory access with non-contiguous patterns
-
-The **Estimated DDR Bandwidth** represents the tool's best estimate of your system's actual DDR bandwidth, taking into account all test results and applying correction factors based on empirical testing.
-
-## How It Works
-
-The tool works by:
-
-1. Allocating large blocks of memory
-2. Performing various memory operations (read, write, copy)
-3. Measuring the time taken to complete these operations
-4. Calculating bandwidth in GB/s based on the amount of data processed and time elapsed
-5. Running multiple iterations to ensure statistical reliability
-6. Applying correction factors to estimate real-world bandwidth
-
-## Limitations
-
-- Results can be affected by system load and background processes
-- Memory bandwidth is shared across all CPU cores, so maximum bandwidth may not be achievable in practice
-- The operating system introduces overhead that can affect measurements
-- Estimated bandwidth has an expected accuracy of approximately ±15%
-
-## Using with JAWS
-
-This tool complements the JAWS memory consumer tool by helping you:
-
-1. Establish a baseline for your system's memory bandwidth
-2. Compare performance before and during JAWS memory consumption
-3. Measure the impact of different memory access patterns on bandwidth
-4. Verify that JAWS is effectively simulating bandwidth constraints
+This project is intended for educational and performance measurement purposes.
+Contributions, bug reports, and feature requests are welcome.
 
 ## License
 
-MIT License
-
-## Troubleshooting
-
-- If you get memory allocation errors, reduce the `--size` parameter
-- If results seem inconsistent, increase the `--iterations` parameter
-- For the most accurate results, close other applications and minimize system activity during testing
-- On systems with NUMA architecture, results may vary depending on memory allocation across nodes
-
-  Maintained by Kyle Fox
-  
+This project is licensed under the MIT License - see the LICENSE file for details.
