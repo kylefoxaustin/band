@@ -422,7 +422,7 @@ def main():
     parser.add_argument("--stream-file", type=str, default=None,
                         help="Path to STREAM benchmark output file for comparison")
     parser.add_argument("--enable-chunking", action="store_true",
-                  help="Enable chunked implementations that may benefit from CPU cache")
+                        help="Enable chunked implementations that may benefit from CPU cache")
     args = parser.parse_args()
     
     # Try to set process priority higher for more consistent results
@@ -476,6 +476,8 @@ def main():
     print(f"Iterations: {args.iterations}")
     if args.chunk_size:
         print(f"Chunk Size: {args.chunk_size} KB")
+    if args.enable_chunking:
+        print("Cache optimization: Enabled (using chunked implementations)")
     print("")
     
     # Common kwargs for all tests
@@ -486,55 +488,55 @@ def main():
         'chunk_size_kb': args.chunk_size
     }
     
-
     # Adjust test selection based on arguments
-if args.triad_only:
-    if args.best:
-        if args.enable_chunking:
-            tests = [
-                ChunkedTriad(**test_kwargs)  # Best with chunking enabled
-            ]
+    if args.triad_only:
+        if args.best:
+            if args.enable_chunking:
+                tests = [
+                    ChunkedTriad(**test_kwargs)  # Best with chunking enabled
+                ]
+            else:
+                tests = [
+                    StreamTriad(**test_kwargs)  # Standard STREAM implementation
+                ]
         else:
             tests = [
-                StreamTriad(**test_kwargs)  # Standard STREAM implementation
+                StreamTriad(**test_kwargs),  # Always include standard implementation
             ]
-    else:
+            if args.enable_chunking:
+                # Only add chunked implementations if explicitly enabled
+                tests.extend([
+                    ChunkedTriad(**test_kwargs),
+                    CombinedTriad(**test_kwargs)
+                ])
+    elif args.best:
+        # Use only the best implementation for each operation
         tests = [
-            StreamTriad(**test_kwargs),  # Always include standard implementation
+            StreamCopy(**test_kwargs),      # Best Copy
+            StreamScale(**test_kwargs),     # Best Scale
+            StreamAdd(**test_kwargs),       # Best Add
         ]
         if args.enable_chunking:
-            # Only add chunked implementations if explicitly enabled
+            tests.append(ChunkedTriad(**test_kwargs))  # Best Triad with chunking
+        else:
+            tests.append(StreamTriad(**test_kwargs))   # Standard STREAM Triad
+    else:
+        # Default test selection - standard STREAM implementations
+        tests = [
+            StreamCopy(**test_kwargs),
+            StreamScale(**test_kwargs),
+            StreamAdd(**test_kwargs),
+            StreamTriad(**test_kwargs),
+            MemcpyTest(**test_kwargs)
+        ]
+        
+        # Add chunked implementations only if explicitly enabled
+        if args.enable_chunking:
             tests.extend([
                 ChunkedTriad(**test_kwargs),
                 CombinedTriad(**test_kwargs)
             ])
-elif args.best:
-    # Use only the best implementation for each operation
-    tests = [
-        StreamCopy(**test_kwargs),      # Best Copy
-        StreamScale(**test_kwargs),     # Best Scale
-        StreamAdd(**test_kwargs),       # Best Add
-    ]
-    if args.enable_chunking:
-        tests.append(ChunkedTriad(**test_kwargs))  # Best Triad with chunking
-    else:
-        tests.append(StreamTriad(**test_kwargs))   # Standard STREAM Triad
-else:
-    # Default test selection - standard STREAM implementations
-    tests = [
-        StreamCopy(**test_kwargs),
-        StreamScale(**test_kwargs),
-        StreamAdd(**test_kwargs),
-        StreamTriad(**test_kwargs),
-        MemcpyTest(**test_kwargs)
-    ]
     
-    # Add chunked implementations only if explicitly enabled
-    if args.enable_chunking:
-        tests.extend([
-            ChunkedTriad(**test_kwargs),
-            CombinedTriad(**test_kwargs)
-        ])
     # Run all tests
     results = {}
     for test in tests:
@@ -550,7 +552,7 @@ else:
             print(f"{test_name}: {result['mean']:.2f} GB/s")
     
     # Compare triad implementations if available
-    if "STREAM Triad" in results:
+    if "STREAM Triad" in results and args.enable_chunking:
         base_triad = results["STREAM Triad"]["mean"]
         print("\nTriad Implementation Comparison (vs STREAM Triad):")
         for test_name, result in results.items():
