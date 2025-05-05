@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BAND: Bandwidth Assessment for NumPy and DDR
+BAND: Bandwidth Assessment for Native DDR
 
 A memory bandwidth measurement tool for Python that provides results
 comparable to the STREAM benchmark. Includes optimized implementations
