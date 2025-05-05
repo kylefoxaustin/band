@@ -1,11 +1,11 @@
-# BAND: Bandwidth Assessment for NumPy and DDR
+# BAND: Bandwidth Assessment for Native DDR 
 
 ![Python](https://img.shields.io/badge/python-3.6+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
 ## Introduction
 
-BAND (Bandwidth Assessment for NumPy and DDR) is a Python-based memory bandwidth measurement tool designed to provide results comparable to the industry-standard STREAM benchmark. It offers optimized implementations for various memory operations with a focus on performance, allowing Python developers to evaluate memory bandwidth in their environments.
+BAND (Bandwidth Assessment for Native DDR) is a Python-based memory bandwidth measurement tool designed to provide results comparable to the industry-standard STREAM benchmark. It offers optimized implementations for various memory operations with a focus on performance, allowing Python developers to evaluate memory bandwidth in their environments.
 
 ## Why BAND was Created
 
