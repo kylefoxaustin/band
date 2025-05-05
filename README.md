@@ -1,28 +1,4 @@
-## How to Use Comparison Results
-
-When you run BAND with the `--compare` option, the tool will output something like this at the end of the results:
-
-```
-Best Python Triad (Chunked Triad) achieves 82.9% of C STREAM Triad performance
-```
-
-This comparison tells you:
-
-1. **Which implementation performed best**: In this case, "Chunked Triad" was the fastest
-2. **Relative performance**: The Python implementation achieved 82.9% of the C implementation's performance
-
-This information is valuable for:
-
-- **Development decisions**: Understanding the performance trade-offs of using Python vs C
-- **Hardware evaluation**: Testing how well Python NumPy utilizes different memory subsystems
-- **Optimization opportunities**: Seeing which Python implementations come closest to C performance
-
-Remember that the comparison is only as accurate as the STREAM-C value you provide. For meaningful results, you should:
-
-1. Run STREAM-C and BAND on the same hardware
-2. Use similar memory sizes and thread counts
-3. Run both tests with minimal system load
-4. Specify the exact STREAM-C Triad value using `--c-stream-triad`# BAND: Bandwidth Assessment for NumPy and DDR
+# BAND: Bandwidth Assessment for NumPy and DDR
 
 ![Python](https://img.shields.io/badge/python-3.6+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
@@ -70,10 +46,6 @@ pip install -r requirements.txt
 chmod +x band.py
 ```
 
-The `requirements.txt` file includes all necessary dependencies:
-- numpy: For efficient array operations
-- psutil: For gathering system information
-
 ## How to Run
 
 Basic usage:
@@ -101,6 +73,7 @@ You can customize the execution with the following options:
 --best                 Run only the best implementation for each operation
 --compare              Compare to C STREAM benchmark results
 --c-stream-triad FLOAT C STREAM Triad result for comparison (default: 19.98 GB/s)
+--stream-file PATH     Path to a file containing the output from a STREAM-C benchmark run
 ```
 
 ## Explanation of CLI Options
@@ -122,33 +95,6 @@ You can customize the execution with the following options:
 - **--c-stream-triad**: Specify your C STREAM Triad result in GB/s for direct comparison.
 
 - **--stream-file**: Path to a file containing the output from a STREAM-C benchmark run. BAND will parse this file to extract all benchmark values for comprehensive comparison.
-
-## Performance Optimization Options
-
-To achieve the best memory bandwidth results, consider trying:
-
-1. **Experiment with thread count** 
-   - Match the number of threads to your CPU's memory channels for optimal results
-   - Try powers of 2: `--threads 1`, `--threads 2`, `--threads 4`, `--threads 8`
-
-2. **Try different chunk sizes**
-   - Smaller chunks (16-128KB) may work better on systems with small caches
-   - Larger chunks (1-8MB) often work better on server-class hardware 
-   - Example: `--chunk-size 512` or `--chunk-size 4096`
-
-3. **Optimize for your workload**
-   - Use `--triad-only` to focus on the most comprehensive test
-   - Compare the standard Triad vs ChunkedTriad implementations
-
-4. **System-level optimizations**
-   - Run with elevated process priority
-   - Disable CPU frequency scaling
-   - Close other memory-intensive applications
-   - Try setting process affinity to specific NUMA nodes if applicable
-
-5. **Memory configurations**
-   - Test with various memory configurations (dual vs. single channel)
-   - Compare DIMM speeds and configurations if possible
 
 ## Comparing with STREAM-C Results
 
@@ -209,6 +155,59 @@ This approach provides several advantages:
 - Ensures you're comparing with results from the same system
 
 BAND will automatically parse the STREAM-C output file, extract the relevant benchmark values, and use them for comparison. The comparison output will show how each BAND operation compares to its STREAM-C counterpart.
+
+## How to Use Comparison Results
+
+When you run BAND with the `--compare` option, the tool will output something like this at the end of the results:
+
+```
+Best Python Triad (Chunked Triad) achieves 82.9% of C STREAM Triad performance
+```
+
+This comparison tells you:
+
+1. **Which implementation performed best**: In this case, "Chunked Triad" was the fastest
+2. **Relative performance**: The Python implementation achieved 82.9% of the C implementation's performance
+
+This information is valuable for:
+
+- **Development decisions**: Understanding the performance trade-offs of using Python vs C
+- **Hardware evaluation**: Testing how well Python NumPy utilizes different memory subsystems
+- **Optimization opportunities**: Seeing which Python implementations come closest to C performance
+
+Remember that the comparison is only as accurate as the STREAM-C value you provide. For meaningful results, you should:
+
+1. Run STREAM-C and BAND on the same hardware
+2. Use similar memory sizes and thread counts
+3. Run both tests with minimal system load
+4. Specify the exact STREAM-C Triad value using `--c-stream-triad`
+
+## Performance Optimization Options
+
+To achieve the best memory bandwidth results, consider trying:
+
+1. **Experiment with thread count** 
+   - Match the number of threads to your CPU's memory channels for optimal results
+   - Try powers of 2: `--threads 1`, `--threads 2`, `--threads 4`, `--threads 8`
+
+2. **Try different chunk sizes**
+   - Smaller chunks (16-128KB) may work better on systems with small caches
+   - Larger chunks (1-8MB) often work better on server-class hardware 
+   - Example: `--chunk-size 512` or `--chunk-size 4096`
+
+3. **Optimize for your workload**
+   - Use `--triad-only` to focus on the most comprehensive test
+   - Compare the standard Triad vs ChunkedTriad implementations
+
+4. **System-level optimizations**
+   - Run with elevated process priority
+   - Disable CPU frequency scaling
+   - Close other memory-intensive applications
+   - Try setting process affinity to specific NUMA nodes if applicable
+
+5. **Memory configurations**
+   - Test with various memory configurations (dual vs. single channel)
+   - Compare DIMM speeds and configurations if possible
 
 ## Example Results
 
