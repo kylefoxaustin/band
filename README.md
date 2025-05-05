@@ -28,8 +28,9 @@ BAND is particularly useful for:
 ### Prerequisites
 
 - Python 3.6 or higher
-- NumPy
-- psutil (for system information)
+- Dependencies listed in requirements.txt:
+  - NumPy: For efficient array operations
+  - psutil: For system information collection
 
 ### Installation
 
@@ -38,12 +39,16 @@ BAND is particularly useful for:
 git clone https://github.com/kylefoxaustin/band.git
 cd band
 
-# Install required packages
-pip install numpy psutil
+# Install required packages using requirements.txt
+pip install -r requirements.txt
 
 # Make the script executable
 chmod +x band.py
 ```
+
+The `requirements.txt` file includes all necessary dependencies:
+- numpy: For efficient array operations
+- psutil: For gathering system information
 
 ## How to Run
 
