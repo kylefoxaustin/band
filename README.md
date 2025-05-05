@@ -124,6 +124,71 @@ To achieve the best memory bandwidth results, consider trying:
    - Test with various memory configurations (dual vs. single channel)
    - Compare DIMM speeds and configurations if possible
 
+## Comparing with STREAM-C Results
+
+BAND offers built-in functionality to compare its results with the industry-standard STREAM benchmark written in C. This allows you to evaluate how the Python implementation performs relative to native code.
+
+### Obtaining STREAM-C Results
+
+To compare with STREAM-C:
+
+1. **Download and compile STREAM**:
+   ```bash
+   # Clone the STREAM repository or download from https://www.cs.virginia.edu/stream/
+   git clone https://github.com/jeffhammond/STREAM.git
+   cd STREAM
+   
+   # Compile with OpenMP support
+   gcc -O3 -fopenmp -DSTREAM_ARRAY_SIZE=100000000 -DNTIMES=10 stream.c -o stream_omp
+   ```
+
+2. **Run STREAM-C**:
+   ```bash
+   # Set thread count (adjust based on your system)
+   export OMP_NUM_THREADS=4
+   
+   # Run the benchmark
+   ./stream_omp
+   ```
+
+3. **Note the results**: Look for the "Function" table in the output, which will show bandwidth for Copy, Scale, Add, and Triad operations.
+
+Example STREAM-C output:
+```
+Function    Best Rate MB/s  Avg time     Min time     Max time
+Copy:           25698.6     0.062431     0.062260     0.062579
+Scale:          17981.4     0.089938     0.088981     0.092308
+Add:            19979.9     0.120457     0.120121     0.122574
+Triad:          19976.2     0.120263     0.120143     0.120580
+```
+
+### Running BAND with STREAM-C Comparison
+
+To compare BAND results with STREAM-C:
+
+1. **Basic comparison**: Use the `--compare` flag with default settings
+   ```bash
+   ./band.py --compare
+   ```
+
+2. **Specify STREAM-C Triad result**: For more accurate comparison
+   ```bash
+   ./band.py --compare --c-stream-triad 19976.2
+   ```
+
+3. **Complete comparison**: Compare all tests with matching configuration
+   ```bash
+   # Match the STREAM-C configuration (threads, problem size)
+   ./band.py --threads 4 --size 2.0 --compare --c-stream-triad 19976.2
+   ```
+
+4. **Focus on specific tests**: Compare only Triad implementations
+   ```bash
+   ./band.py --triad-only --compare --c-stream-triad 19976.2
+   ```
+
+The comparison output will show you what percentage of STREAM-C performance your Python implementation achieves. Typically, Python NumPy implementations achieve 70-90% of C performance, depending on system configuration and optimization.
+
 ## Example Results
 
 ```
