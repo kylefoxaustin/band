@@ -558,15 +558,16 @@ def main():
                     "STREAM Add": "Add",
                     "STREAM Triad": "Triad",
                     "Chunked Triad": "Triad",
-                    "Combined Triad": "Triad"
+                    "Combined Triad": "Triad",
+                    "MEMCPY": "Copy"
                 }
                 
                 for test_name, result in results.items():
                     if test_name in operation_map and stream_results[operation_map[test_name]] is not None:
-                        stream_value = stream_results[operation_map[test_name]]
-                        python_value = result["mean"]
+                        stream_value = stream_results[operation_map[test_name]]  # Already in MB/s
+                        python_value = result["mean"] * 1024.0  # Convert GB/s to MB/s
                         ratio = python_value / stream_value * 100
-                        print(f"  {test_name}: {python_value:.2f} GB/s ({ratio:.1f}% of C {operation_map[test_name]} @ {stream_value:.2f} GB/s)")
+                        print(f"  {test_name}: {python_value:.2f} MB/s ({ratio:.1f}% of C {operation_map[test_name]} @ {stream_value:.2f} MB/s)")
             elif c_stream_triad > 0:
                 # Only compare Triad with command-line value
                 best_triad = 0
@@ -577,8 +578,11 @@ def main():
                         best_name = test_name
                 
                 if best_triad > 0:
-                    ratio = best_triad / c_stream_triad * 100
+                    # Convert GB/s to MB/s for display
+                    best_triad_mb = best_triad * 1024.0
+                    ratio = best_triad_mb / c_stream_triad * 100
                     print(f"  Best Python Triad ({best_name}) achieves {ratio:.1f}% of C STREAM Triad performance")
+                    print(f"  {best_name}: {best_triad_mb:.2f} MB/s vs C STREAM Triad: {c_stream_triad:.2f} MB/s")
     
 
 if __name__ == "__main__":
