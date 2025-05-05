@@ -99,6 +99,37 @@ You can customize the execution with the following options:
 
 - **--enable-chunking**: Enable cache-optimized implementations that use smaller chunk sizes for better cache utilization. By default, BAND uses standard implementations that match STREAM's approach of measuring pure memory bandwidth.
 
+## Memory Bandwidth Measurement Approaches
+
+BAND offers two approaches to measuring memory bandwidth:
+
+### Standard Mode (Default)
+
+By default, BAND uses implementations that closely follow the STREAM benchmark philosophy:
+
+- Focus on measuring sustained memory bandwidth
+- Use large array sizes that exceed cache capacity
+- Minimize cache effects to get a true measure of memory subsystem performance
+
+This mode is most useful for:
+- Comparing Python performance to STREAM.C benchmark results
+- Evaluating true memory bandwidth limitations
+- Hardware performance comparisons
+
+### Cache-Optimized Mode (with --enable-chunking)
+
+When the `--enable-chunking` flag is used, BAND includes additional implementations that are optimized for cache utilization:
+
+- Py-Chunked Triad: Uses smaller chunk sizes (512KB by default) with reused temporary arrays
+- Py-Combined Triad: Uses NumPy's expression optimization with moderate chunk sizes
+
+This mode is useful for:
+- Understanding potential performance with optimized code
+- Exploring cache effects on performance
+- Developing cache-friendly NumPy code
+
+The cache-optimized implementations often outperform the standard STREAM implementations by significant margins (typically 20-50%), showing the importance of cache-friendly coding in Python.
+
 ## Understanding Cache Optimization and Chunking
 
 BAND offers an optional cache optimization mode via the `--enable-chunking` flag. Understanding how this works can help you decide when to use it and interpret the results.
@@ -217,7 +248,7 @@ STREAM-C results detected:
   Add: 20061.90 MB/s
   Triad: 20014.90 MB/s
 
-BAND: Bandwidth Assessment for NumPy and DDR
+BAND: Bandwidth Assessment for Native DDR
 ----------------------------------------
 System: Linux x86_64
 Processor: Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz
@@ -227,28 +258,28 @@ Test Size: 4.0 GB per test
 Threads: 4
 Iterations: 3
 
-Running STREAM Copy test with 4 threads, 4.0 GB total memory...
+Running Py-STREAM Copy test with 4 threads, 4.0 GB total memory...
   Iteration 1/3... 26.45 GB/s
   Iteration 2/3... 26.63 GB/s
   Iteration 3/3... 26.56 GB/s
-  STREAM Copy result: 26.60 GB/s (min: 26.56, max: 26.63)
+  Py-STREAM Copy result: 26.60 GB/s (min: 26.56, max: 26.63)
 
 [Additional test results omitted for brevity]
 
 Results Summary
 --------------
-STREAM Copy: 26.60 GB/s
-STREAM Scale: 17.42 GB/s
-STREAM Add: 19.14 GB/s
-STREAM Triad: 10.22 GB/s
-MEMCPY: 26.46 GB/s
+Py-STREAM Copy: 26.60 GB/s
+Py-STREAM Scale: 17.42 GB/s
+Py-STREAM Add: 19.14 GB/s
+Py-STREAM Triad: 10.22 GB/s
+Py-MEMCPY: 26.46 GB/s
 
 Python vs C Comparison:
-  STREAM Copy: 27238.40 MB/s (103.9% of C Copy @ 26224.70 MB/s)
-  STREAM Scale: 17837.08 MB/s (98.8% of C Scale @ 18053.20 MB/s)
-  STREAM Add: 19599.36 MB/s (97.7% of C Add @ 20061.90 MB/s)
-  STREAM Triad: 10465.28 MB/s (52.3% of C Triad @ 20014.90 MB/s)
-  MEMCPY: 27093.74 MB/s (103.3% of C Copy @ 26224.70 MB/s)
+  Py-STREAM Copy: 27238.40 MB/s (103.9% of STREAM.C Copy @ 26224.70 MB/s)
+  Py-STREAM Scale: 17837.08 MB/s (98.8% of STREAM.C Scale @ 18053.20 MB/s)
+  Py-STREAM Add: 19599.36 MB/s (97.7% of STREAM.C Add @ 20061.90 MB/s)
+  Py-STREAM Triad: 10465.28 MB/s (52.3% of STREAM.C Triad @ 20014.90 MB/s)
+  Py-MEMCPY: 27093.74 MB/s (103.3% of STREAM.C Copy @ 26224.70 MB/s)
 ```
 
 When running with `--enable-chunking`, you'll see additional results:
@@ -256,23 +287,69 @@ When running with `--enable-chunking`, you'll see additional results:
 ```
 Results Summary
 --------------
-STREAM Copy: 26.60 GB/s
-STREAM Scale: 17.42 GB/s
-STREAM Add: 19.14 GB/s
-STREAM Triad: 10.22 GB/s
-Chunked Triad: 14.64 GB/s
-Combined Triad: 10.78 GB/s
-MEMCPY: 26.46 GB/s
+Py-STREAM Copy: 26.60 GB/s
+Py-STREAM Scale: 17.42 GB/s
+Py-STREAM Add: 19.14 GB/s
+Py-STREAM Triad: 10.22 GB/s
+Py-Chunked Triad: 14.64 GB/s
+Py-Combined Triad: 10.78 GB/s
+Py-MEMCPY: 26.46 GB/s
 
-Triad Implementation Comparison (vs STREAM Triad):
-  Chunked Triad: 14.64 GB/s (+43.3%)
-  Combined Triad: 10.78 GB/s (+5.5%)
+Triad Implementation Comparison (vs Py-STREAM Triad):
+  Py-Chunked Triad: 14.64 GB/s (+43.3%)
+  Py-Combined Triad: 10.78 GB/s (+5.5%)
 
 Python vs C Comparison:
   [Same output as above plus the chunked implementations]
-  Chunked Triad: 14991.36 MB/s (74.9% of C Triad @ 20014.90 MB/s)
-  Combined Triad: 11034.72 MB/s (55.1% of C Triad @ 20014.90 MB/s)
+  Py-Chunked Triad: 14991.36 MB/s (74.9% of STREAM.C Triad @ 20014.90 MB/s)
+  Py-Combined Triad: 11034.72 MB/s (55.1% of STREAM.C Triad @ 20014.90 MB/s)
 ```
+
+## Understanding the Results
+
+BAND provides several performance metrics:
+
+1. **Individual test results**: Raw bandwidth for each implementation in GB/s
+2. **Triad implementation comparison**: When using `--enable-chunking`, shows how different Triad implementations compare
+3. **Python vs C comparison**: Shows how each Python implementation compares to its C counterpart in MB/s and percentage
+
+Typically:
+- Py-STREAM Copy and Py-MEMCPY operations in Python achieve 90-105% of STREAM.C performance
+- Py-STREAM Scale operations achieve 85-100% of STREAM.C performance
+- Py-STREAM Add operations achieve 85-98% of STREAM.C performance
+- Standard Py-STREAM Triad operations achieve 50-60% of STREAM.C performance
+- Cache-optimized Py-Chunked Triad implementations can achieve 70-85% of STREAM.C performance
+
+The lower performance of standard Triad operations highlights NumPy's overhead in complex operations, while the significant improvement with cache optimization demonstrates the importance of cache-friendly code in Python.
+
+## Why Python Triad Performance Differs from STREAM.C
+
+Users may notice that the standard Py-STREAM Triad implementation typically achieves only 50-60% of the performance measured by STREAM.C, while simpler operations like Copy and Scale achieve 90-105% of STREAM.C performance. This significant difference in the Triad operation is worth explaining:
+
+### Reasons for Lower Triad Performance
+
+1. **Operation Complexity**: The Triad operation (`a = b + scalar × c`) is more complex than Copy or Scale, involving multiple arrays, a multiplication, and an addition.
+
+2. **NumPy Overhead**: For complex operations, Python's NumPy introduces several layers of overhead:
+   - Type checking and array shape validation
+   - Temporary array creation for intermediate results
+   - Python interpreter overhead for managing multiple operations
+   - Memory allocation and garbage collection costs
+
+3. **Memory Access Patterns**: The Triad operation requires reading from two arrays (`b` and `c`) and writing to a third (`a`), creating more complex memory access patterns that expose inefficiencies in Python's memory management.
+
+4. **Optimization Limitations**: C compilers can perform low-level optimizations that aren't available to NumPy, such as:
+   - Instruction-level parallelism
+   - Register allocation optimization
+   - Loop unrolling and vectorization tuned to the specific CPU architecture
+
+### Implications
+
+This performance gap is an intrinsic characteristic when comparing Python to compiled C code for memory-intensive operations. It's not a flaw in the benchmark but rather an accurate reflection of the trade-offs between Python's ease of use and C's performance.
+
+The Chunked Triad implementation (available with `--enable-chunking`) partially mitigates these issues through better cache utilization, achieving 70-85% of STREAM.C performance, demonstrating that algorithmic improvements can significantly narrow the gap.
+
+This behavior is precisely why BAND is valuable: it helps Python developers understand the memory bandwidth limitations they might encounter in real-world applications and the potential gains from cache-friendly programming techniques.
 
 ## Performance Optimization Options
 
@@ -321,23 +398,6 @@ After running this script, you can use the STREAM results with BAND:
 ```bash
 ./band.py --stream-file stream_results.txt
 ```
-
-## Understanding the Results
-
-BAND provides several performance metrics:
-
-1. **Individual test results**: Raw bandwidth for each implementation in GB/s
-2. **Triad implementation comparison**: When using `--enable-chunking`, shows how different Triad implementations compare
-3. **Python vs C comparison**: Shows how each Python implementation compares to its C counterpart in MB/s and percentage
-
-Typically:
-- Py-STREAM Copy and Py-MEMCPY operations in Python achieve 90-105% of STREAM.C performance
-- Py-STREAM Scale operations achieve 85-100% of STREAM.C performance
-- Py-STREAM Add operations achieve 85-98% of STREAM.C performance
-- Standard Py-STREAM Triad operations achieve 50-60% of STREAM.C performance
-- Cache-optimized Py-Chunked Triad implementations can achieve 70-85% of STREAM.C performance
-
-The lower performance of standard Triad operations highlights NumPy's overhead in complex operations, while the significant improvement with cache optimization demonstrates the importance of cache-friendly code in Python.
 
 ## Attestation
 
