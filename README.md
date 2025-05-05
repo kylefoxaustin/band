@@ -1,4 +1,28 @@
-# BAND: Bandwidth Assessment for NumPy and DDR
+## How to Use Comparison Results
+
+When you run BAND with the `--compare` option, the tool will output something like this at the end of the results:
+
+```
+Best Python Triad (Chunked Triad) achieves 82.9% of C STREAM Triad performance
+```
+
+This comparison tells you:
+
+1. **Which implementation performed best**: In this case, "Chunked Triad" was the fastest
+2. **Relative performance**: The Python implementation achieved 82.9% of the C implementation's performance
+
+This information is valuable for:
+
+- **Development decisions**: Understanding the performance trade-offs of using Python vs C
+- **Hardware evaluation**: Testing how well Python NumPy utilizes different memory subsystems
+- **Optimization opportunities**: Seeing which Python implementations come closest to C performance
+
+Remember that the comparison is only as accurate as the STREAM-C value you provide. For meaningful results, you should:
+
+1. Run STREAM-C and BAND on the same hardware
+2. Use similar memory sizes and thread counts
+3. Run both tests with minimal system load
+4. Specify the exact STREAM-C Triad value using `--c-stream-triad`# BAND: Bandwidth Assessment for NumPy and DDR
 
 ![Python](https://img.shields.io/badge/python-3.6+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
@@ -93,9 +117,11 @@ You can customize the execution with the following options:
 
 - **--best**: Run only the best implementation for each operation type, which is useful for maximum performance measurement with minimal testing time.
 
-- **--compare**: Enable comparison with C STREAM benchmark results.
+- **--compare**: Enable comparison with C STREAM benchmark results using default reference values.
 
 - **--c-stream-triad**: Specify your C STREAM Triad result in GB/s for direct comparison.
+
+- **--stream-file**: Path to a file containing the output from a STREAM-C benchmark run. BAND will parse this file to extract all benchmark values for comprehensive comparison.
 
 ## Performance Optimization Options
 
@@ -162,32 +188,27 @@ Add:            19979.9     0.120457     0.120121     0.122574
 Triad:          19976.2     0.120263     0.120143     0.120580
 ```
 
-### Running BAND with STREAM-C Comparison
+### Automated Comparison with STREAM-C Results
 
-To compare BAND results with STREAM-C:
+For more accurate and convenient comparison, BAND can automatically read STREAM-C results from an output file:
 
-1. **Basic comparison**: Use the `--compare` flag with default settings
+1. **Save STREAM-C results to a file**:
    ```bash
-   ./band.py --compare
+   # Run STREAM-C and save output to a file
+   export OMP_NUM_THREADS=4 && ./stream_omp > stream_results.txt
    ```
 
-2. **Specify STREAM-C Triad result**: For more accurate comparison
+2. **Run BAND with the results file**:
    ```bash
-   ./band.py --compare --c-stream-triad 19976.2
+   ./band.py --stream-file stream_results.txt
    ```
 
-3. **Complete comparison**: Compare all tests with matching configuration
-   ```bash
-   # Match the STREAM-C configuration (threads, problem size)
-   ./band.py --threads 4 --size 2.0 --compare --c-stream-triad 19976.2
-   ```
+This approach provides several advantages:
+- More accurate comparisons using all measured operations (Copy, Scale, Add, Triad)
+- No need to manually extract and input values
+- Ensures you're comparing with results from the same system
 
-4. **Focus on specific tests**: Compare only Triad implementations
-   ```bash
-   ./band.py --triad-only --compare --c-stream-triad 19976.2
-   ```
-
-The comparison output will show you what percentage of STREAM-C performance your Python implementation achieves. Typically, Python NumPy implementations achieve 70-90% of C performance, depending on system configuration and optimization.
+BAND will automatically parse the STREAM-C output file, extract the relevant benchmark values, and use them for comparison. The comparison output will show how each BAND operation compares to its STREAM-C counterpart.
 
 ## Example Results
 
