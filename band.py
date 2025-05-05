@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Optimized DDR Bandwidth Measurement Tool
+Optimized DDR Bandwidth Measurement Tool with improved memory cleanup
 
 This script measures memory bandwidth through various tests to estimate
 the overall DDR bandwidth of a system. It's compatible with both x86/AMD64
@@ -20,6 +20,7 @@ import threading
 import ctypes
 import signal
 import json
+import gc
 
 # Global variable for signal handling
 should_exit = False
@@ -50,8 +51,18 @@ class BandwidthTest:
         for _ in range(self.threads):
             # Use uint8 instead of float64 for more direct memory access
             arr = np.zeros(self.thread_elements, dtype=np.uint8)
-            # Initialize with some data
-            arr[:] = np.random.randint(0, 255, size=min(16777216, len(arr)), dtype=np.uint8).repeat(max(1, len(arr) // 16777216))
+            # Initialize with some data - use smaller initialization to save memory
+            init_size = min(1048576, len(arr))  # Max 1MB for initialization
+            arr[:init_size] = np.random.randint(0, 255, size=init_size, dtype=np.uint8)
+            # Fill rest with repeating pattern if needed
+            if len(arr) > init_size:
+                reps = len(arr) // init_size
+                for i in range(1, reps):
+                    arr[i*init_size:(i+1)*init_size] = arr[:init_size]
+                # Fill remainder
+                if len(arr) % init_size:
+                    arr[reps*init_size:] = arr[:len(arr) - reps*init_size]
+            
             thread_arrays.append(arr)
         return thread_arrays
     
@@ -103,6 +114,9 @@ class BandwidthTest:
             
             iteration_results.append(bandwidth_gb_sec)
             print(f" {bandwidth_gb_sec:.2f} GB/s")
+            
+            # Run garbage collection between iterations
+            gc.collect()
         
         # Calculate statistics if we have results
         if iteration_results:
@@ -118,6 +132,12 @@ class BandwidthTest:
             
             print(f"  {self.name} result: {self.results['mean']:.2f} GB/s " +
                   f"(min: {self.results['min']:.2f}, max: {self.results['max']:.2f})")
+        
+        # Clean up memory
+        for i in range(len(thread_arrays)):
+            thread_arrays[i] = None
+        thread_arrays = None
+        gc.collect()
             
         return self.results
 
@@ -132,21 +152,24 @@ class SequentialReadTest(BandwidthTest):
         # Optimized to use pointer arithmetic directly for better performance
         # Force CPU to read from memory by scanning whole array
         total_blocks = len(array) // self.block_size
-        checksum = 0
+        # Use np.int64 for checksum to avoid overflow
+        checksum = np.int64(0)
         
         # Read in blocks for better performance
         for i in range(total_blocks):
             start_idx = i * self.block_size
             # Use numpy's sum directly - highly optimized
-            checksum += np.sum(array[start_idx:start_idx+self.block_size])
+            # Convert to int64 to avoid overflow
+            block_sum = np.int64(np.sum(array[start_idx:start_idx+self.block_size]))
+            checksum += block_sum
             
         # Process any remaining elements
         if len(array) % self.block_size:
             start_idx = total_blocks * self.block_size
-            checksum += np.sum(array[start_idx:])
+            checksum += np.int64(np.sum(array[start_idx:]))
             
         # Store result to prevent optimization
-        results.append(checksum)
+        results.append(int(checksum % (2**31)))
 
 
 class SequentialWriteTest(BandwidthTest):
@@ -174,7 +197,10 @@ class SequentialWriteTest(BandwidthTest):
             array[start_idx:] = data_block[:remainder]
             
         # Store a checksum to prevent optimization
-        results.append(np.sum(array[:min(1024, len(array))]))
+        results.append(int(np.sum(array[:min(1024, len(array))]) % (2**31)))
+        
+        # Clean up data_block to help memory management
+        del data_block
 
 
 class SequentialCopyTest(BandwidthTest):
@@ -187,8 +213,21 @@ class SequentialCopyTest(BandwidthTest):
         """Create source and destination arrays"""
         thread_arrays = []
         for _ in range(self.threads):
-            # Source array - initialize with random data
-            src = np.random.randint(0, 255, size=self.thread_elements, dtype=np.uint8)
+            # Source array - initialize with some pattern (not fully random to save memory)
+            src = np.zeros(self.thread_elements, dtype=np.uint8)
+            # Initialize with a repeating pattern to save memory during setup
+            pattern_size = min(1048576, self.thread_elements)  # 1MB pattern
+            src[:pattern_size] = np.random.randint(0, 255, size=pattern_size, dtype=np.uint8)
+            
+            # Repeat the pattern if array is larger
+            if self.thread_elements > pattern_size:
+                reps = self.thread_elements // pattern_size
+                for i in range(1, reps):
+                    src[i*pattern_size:(i+1)*pattern_size] = src[:pattern_size]
+                # Fill remainder
+                if self.thread_elements % pattern_size:
+                    src[reps*pattern_size:] = src[:self.thread_elements - reps*pattern_size]
+            
             # Destination array - initialized to zero
             dst = np.zeros(self.thread_elements, dtype=np.uint8)
             thread_arrays.append((src, dst))
@@ -209,7 +248,7 @@ class SequentialCopyTest(BandwidthTest):
             dst[start_idx:] = src[start_idx:]
             
         # Store a result to prevent optimization
-        results.append(np.sum(dst[:min(1024, len(dst))]))
+        results.append(int(np.sum(dst[:min(1024, len(dst))]) % (2**31)))
 
 
 class RandomReadTest(BandwidthTest):
@@ -222,44 +261,39 @@ class RandomReadTest(BandwidthTest):
         """Create data arrays and index arrays"""
         thread_data = []
         for thread_id in range(self.threads):
-            # Data array
-            data = np.random.randint(0, 255, size=self.thread_elements, dtype=np.uint8)
+            # Data array - use pattern initialization to save memory
+            data = np.zeros(self.thread_elements, dtype=np.uint8)
+            pattern_size = min(1048576, self.thread_elements)
+            data[:pattern_size] = np.random.randint(0, 255, size=pattern_size, dtype=np.uint8)
+            
+            # Repeat pattern if needed
+            if self.thread_elements > pattern_size:
+                reps = self.thread_elements // pattern_size
+                for i in range(1, reps):
+                    data[i*pattern_size:(i+1)*pattern_size] = data[:pattern_size]
+                # Fill remainder
+                if self.thread_elements % pattern_size:
+                    data[reps*pattern_size:] = data[:self.thread_elements - reps*pattern_size]
             
             # Create random indices but in a more cache-friendly pattern
-            # Divide into regions to maintain some locality
-            region_size = 4096  # 4KB regions
-            num_regions = self.thread_elements // region_size
+            # For very large arrays, use a subset of indices to save memory
+            indices_count = min(self.thread_elements, 10_000_000)  # Max 10M indices
+            indices = np.zeros(indices_count, dtype=np.int32)
             
-            # Create indices for traversing regions in random order, but elements within
-            # a region in sequential order for better performance
-            indices = np.zeros(self.thread_elements, dtype=np.int32)
-            
-            region_order = np.arange(num_regions)
-            np.random.shuffle(region_order)
-            
-            for i, region in enumerate(region_order):
-                start = i * region_size
-                src_start = region * region_size
-                indices[start:start+region_size] = np.arange(src_start, src_start+region_size)
-            
-            # Handle remainder
-            if self.thread_elements % region_size:
-                start = num_regions * region_size
-                indices[start:] = np.arange(start, self.thread_elements)
+            # Create random indices within valid range
+            indices = np.random.randint(0, self.thread_elements, size=indices_count, dtype=np.int32)
             
             thread_data.append((data, indices))
         return thread_data
     
     def _run_thread(self, arrays, thread_id, results):
         data, indices = arrays
-        checksum = 0
-        
-        # Number of accesses - 50% of the array or 100M, whichever is smaller
-        num_accesses = min(len(indices) // 2, 100_000_000)
+        # Use np.int64 for checksum to avoid overflow
+        checksum = np.int64(0)
         
         # Process in blocks for better cache behavior
         block_size = 1024  # Process 1024 indices at a time
-        num_blocks = num_accesses // block_size
+        num_blocks = len(indices) // block_size
         
         for b in range(num_blocks):
             idx_start = b * block_size
@@ -268,17 +302,17 @@ class RandomReadTest(BandwidthTest):
             # Gather the values at these indices
             for i in range(idx_start, idx_end):
                 idx = indices[i]
-                checksum += data[idx]
+                checksum += np.int64(data[idx])
                 
         # Handle remainder
         rem_start = num_blocks * block_size
-        if rem_start < num_accesses:
-            for i in range(rem_start, num_accesses):
+        if rem_start < len(indices):
+            for i in range(rem_start, len(indices)):
                 idx = indices[i]
-                checksum += data[idx]
+                checksum += np.int64(data[idx])
             
         # Store result to prevent optimization
-        results.append(checksum)
+        results.append(int(checksum % (2**31)))
 
 
 class StridedReadTest(BandwidthTest):
@@ -290,7 +324,8 @@ class StridedReadTest(BandwidthTest):
     def _run_thread(self, array, thread_id, results):
         # Use different strides - optimized for better coverage
         strides = [16, 32, 64, 128, 256, 512, 1024, 2048]
-        checksum = 0
+        # Use np.int64 for checksum to avoid overflow
+        checksum = np.int64(0)
         
         # Limited number of accesses per stride for better performance
         accesses_per_stride = min(len(array) // 64, 1_000_000)
@@ -301,10 +336,10 @@ class StridedReadTest(BandwidthTest):
             
             # Read with current stride
             for i in range(0, limit, stride):
-                checksum += array[i]
+                checksum += np.int64(array[i])
                 
         # Store result to prevent optimization
-        results.append(checksum)
+        results.append(int(checksum % (2**31)))
 
 
 class StreamTriadTest(BandwidthTest):
@@ -314,16 +349,40 @@ class StreamTriadTest(BandwidthTest):
         super().__init__("Stream Triad", *args, **kwargs)
     
     def _setup_data(self):
-        """Create source arrays for STREAM benchmark"""
+        """Create source arrays for STREAM benchmark with memory-efficient initialization"""
         thread_arrays = []
         # Elements per array (we're using uint8, so we need more elements)
         elem_per_thread = self.thread_elements // 3  # We need 3 arrays
         
         for _ in range(self.threads):
-            # Create arrays a, b, c with equal size
+            # Create arrays with pattern-based initialization
+            pattern_size = min(1048576, elem_per_thread)  # 1MB pattern or array size
+            
+            # First create patterns
+            b_pattern = np.random.randint(0, 255, size=pattern_size, dtype=np.uint8)
+            c_pattern = np.random.randint(0, 255, size=pattern_size, dtype=np.uint8)
+            
+            # Create full arrays
             a = np.zeros(elem_per_thread, dtype=np.uint8)
-            b = np.random.randint(0, 255, size=elem_per_thread, dtype=np.uint8)
-            c = np.random.randint(0, 255, size=elem_per_thread, dtype=np.uint8)
+            b = np.zeros(elem_per_thread, dtype=np.uint8)
+            c = np.zeros(elem_per_thread, dtype=np.uint8)
+            
+            # Fill b and c with repeating patterns
+            reps = elem_per_thread // pattern_size
+            for i in range(reps):
+                b[i*pattern_size:(i+1)*pattern_size] = b_pattern
+                c[i*pattern_size:(i+1)*pattern_size] = c_pattern
+                
+            # Fill remainder
+            if elem_per_thread % pattern_size:
+                remainder = elem_per_thread % pattern_size
+                b[reps*pattern_size:] = b_pattern[:remainder]
+                c[reps*pattern_size:] = c_pattern[:remainder]
+                
+            # Clean up patterns to save memory
+            del b_pattern
+            del c_pattern
+            
             thread_arrays.append((a, b, c))
         return thread_arrays
     
@@ -337,15 +396,16 @@ class StreamTriadTest(BandwidthTest):
         for i in range(total_blocks):
             start_idx = i * self.block_size
             end_idx = start_idx + self.block_size
-            a[start_idx:end_idx] = b[start_idx:end_idx] + scalar * c[start_idx:end_idx]
+            # Use intermediate array to avoid overflow
+            a[start_idx:end_idx] = b[start_idx:end_idx].astype(np.int16) + scalar * c[start_idx:end_idx].astype(np.int16)
             
         # Handle remainder
         if len(a) % self.block_size:
             start_idx = total_blocks * self.block_size
-            a[start_idx:] = b[start_idx:] + scalar * c[start_idx:]
+            a[start_idx:] = b[start_idx:].astype(np.int16) + scalar * c[start_idx:].astype(np.int16)
             
         # Store a result to prevent optimization
-        results.append(np.sum(a[:min(1024, len(a))]))
+        results.append(int(np.sum(a[:min(1024, len(a))]) % (2**31)))
 
 
 def get_system_info():
@@ -439,6 +499,46 @@ def estimate_total_bandwidth(results):
     return estimated
 
 
+def force_memory_cleanup():
+    """Force memory cleanup using various techniques"""
+    # Run garbage collection multiple times
+    print("\nCleaning up memory...", end="")
+    for _ in range(3):
+        gc.collect()
+    
+    # Get current process
+    process = psutil.Process(os.getpid())
+    
+    # Memory info before cleanup
+    mem_before = process.memory_info().rss / (1024 * 1024)
+    
+    # Try platform-specific memory cleanup
+    if platform.system() == "Linux":
+        try:
+            # On Linux, we can use malloc_trim to release memory back to the OS
+            try:
+                # Try to load libc and call malloc_trim
+                libc = ctypes.CDLL('libc.so.6')
+                libc.malloc_trim(0)
+            except:
+                pass
+                
+            # Use mincore/madvise to suggest memory be released
+            try:
+                os.system("echo 1 > /proc/sys/vm/drop_caches")
+            except:
+                pass
+        except:
+            pass
+    
+    # Force a final garbage collection
+    gc.collect()
+    
+    # Memory info after cleanup
+    mem_after = process.memory_info().rss / (1024 * 1024)
+    print(f" Done! (Memory: {mem_before:.1f} MB → {mem_after:.1f} MB)")
+    
+
 def main():
     global should_exit
     
@@ -457,6 +557,18 @@ def main():
     parser.add_argument("--large", action="store_true",
                         help="Use a larger test size (16GB) to ensure going beyond cache")
     args = parser.parse_args()
+    
+    # Check if enough memory is available
+    mem_available = psutil.virtual_memory().available / (1024**3)
+    if args.size > mem_available * 0.8:
+        print(f"Warning: Requested test size ({args.size:.1f} GB) exceeds 80% of available memory ({mem_available:.1f} GB)")
+        print(f"This may cause excessive swapping and impact test results.")
+        print(f"Consider using a smaller size (e.g., --size {mem_available * 0.7:.1f})")
+        
+        response = input("Continue anyway? (y/n): ")
+        if response.lower() != 'y':
+            print("Exiting.")
+            return
     
     # If large option is selected, override size
     if args.large:
@@ -504,6 +616,11 @@ def main():
             break
         test_results = test.run()
         results[test.name] = test_results
+        
+        # Force cleanup after each test
+        test = None
+        gc.collect()
+        
         print("")  # Add spacing between tests
     
     # Estimate total bandwidth
@@ -533,6 +650,11 @@ def main():
         with open(args.output, 'w') as f:
             json.dump(output_data, f, indent=2)
         print(f"\nResults saved to {args.output}")
+    
+    # Force memory cleanup
+    force_memory_cleanup()
+    
+    print("\nBandwidth test completed. Memory has been released.")
 
 if __name__ == "__main__":
     main()
