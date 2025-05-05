@@ -1,4 +1,4 @@
-# BAND: Bandwidth Assessment for Native DDR 
+# BAND: Bandwidth Assessment for Native DDR
 
 ![Python](https://img.shields.io/badge/python-3.6+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
@@ -331,10 +331,11 @@ BAND provides several performance metrics:
 3. **Python vs C comparison**: Shows how each Python implementation compares to its C counterpart in MB/s and percentage
 
 Typically:
-- Copy and Scale operations in Python achieve 90-105% of C performance
-- Add operations achieve 85-98% of C performance
-- Standard Triad operations achieve 50-60% of C performance
-- Cache-optimized Triad implementations can achieve 70-85% of C performance
+- Py-STREAM Copy and Py-MEMCPY operations in Python achieve 90-105% of STREAM.C performance
+- Py-STREAM Scale operations achieve 85-100% of STREAM.C performance
+- Py-STREAM Add operations achieve 85-98% of STREAM.C performance
+- Standard Py-STREAM Triad operations achieve 50-60% of STREAM.C performance
+- Cache-optimized Py-Chunked Triad implementations can achieve 70-85% of STREAM.C performance
 
 The lower performance of standard Triad operations highlights NumPy's overhead in complex operations, while the significant improvement with cache optimization demonstrates the importance of cache-friendly code in Python.
 
