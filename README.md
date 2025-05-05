@@ -99,36 +99,60 @@ You can customize the execution with the following options:
 
 - **--enable-chunking**: Enable cache-optimized implementations that use smaller chunk sizes for better cache utilization. By default, BAND uses standard implementations that match STREAM's approach of measuring pure memory bandwidth.
 
-## Memory Bandwidth Measurement Approaches
+## Understanding Cache Optimization and Chunking
 
-BAND offers two approaches to measuring memory bandwidth:
+BAND offers an optional cache optimization mode via the `--enable-chunking` flag. Understanding how this works can help you decide when to use it and interpret the results.
 
-### Standard Mode (Default)
+### How Chunking Works
 
-By default, BAND uses implementations that closely follow the STREAM benchmark philosophy:
+The ChunkedTriad implementation (enabled with `--enable-chunking`) processes data in small chunks (512KB by default) using a reusable temporary array. Here's how it works:
 
-- Focus on measuring sustained memory bandwidth
-- Use large array sizes that exceed cache capacity
-- Minimize cache effects to get a true measure of memory subsystem performance
+1. **Data Segmentation**: Instead of processing the entire large arrays at once, the algorithm divides them into manageable chunks
+2. **Temporary Array Reuse**: It creates a single small temporary array that gets reused for each chunk
+3. **Sequential Processing**: Each chunk is processed completely before moving to the next
 
-This mode is most useful for:
-- Comparing Python performance to C STREAM benchmark results
-- Evaluating true memory bandwidth limitations
-- Hardware performance comparisons
+Standard STREAM implementations intentionally use very large arrays to measure sustained memory bandwidth without cache benefits. In contrast, chunking takes advantage of cache behavior to optimize performance.
 
-### Cache-Optimized Mode (with --enable-chunking)
+### Cache Utilization in ChunkedTriad
 
-When the `--enable-chunking` flag is used, BAND includes additional implementations that are optimized for cache utilization:
+When using 512KB chunks on a system with, for example, a 1MB L2 cache:
 
-- ChunkedTriad: Uses smaller chunk sizes (512KB by default) with reused temporary arrays
-- CombinedTriad: Uses NumPy's expression optimization with moderate chunk sizes
+- The working set (portions of arrays a, b, c, and the temporary array) is approximately 2MB total
+- This exceeds the L2 cache size, so not all data remains cache-resident
+- However, the temporary array can remain entirely in cache
+- Between 25-50% of the data from the main arrays might remain in cache between operations
+- The rest will be evicted and reloaded as needed
 
-This mode is useful for:
-- Understanding potential performance with optimized code
-- Exploring cache effects on performance
-- Developing cache-friendly NumPy code
+This improved cache utilization explains why the chunked implementation typically outperforms the standard implementation by 30-50% or more.
 
-The cache-optimized implementations often outperform the standard STREAM implementations by significant margins (typically 20-50%), showing the importance of cache-friendly coding in Python.
+### When to Use Chunking
+
+Use standard mode (default):
+- When you want to measure true memory subsystem bandwidth
+- For direct comparison with STREAM benchmark results
+- To evaluate hardware memory performance
+- For comparing different systems' memory bandwidth
+
+Use chunking mode (`--enable-chunking`):
+- When you want to see the potential performance of cache-optimized code
+- To understand how much performance is left "on the table" with naive implementations
+- For developing algorithms that will work with large datasets
+- To experiment with different chunk sizes for your specific CPU architecture
+
+### Experimenting with Chunk Sizes
+
+You can customize the chunk size with the `--chunk-size` parameter (in KB):
+```bash
+./band.py --enable-chunking --chunk-size 256
+```
+
+Different CPUs have different cache sizes and behaviors. Experimenting with chunk sizes can reveal the optimal size for your specific hardware:
+
+- Values smaller than your L1 cache (typically 32-64KB per core) might show best performance
+- Values that fit in L2 cache (typically 256KB-1MB per core) often perform well
+- Values that exceed L3 cache (typically 2-32MB shared) will approach standard STREAM performance
+
+Observing how performance changes with different chunk sizes can provide insights into your CPU's cache hierarchy and help you optimize real-world NumPy code.
 
 ## Comparing with STREAM-C Results
 
