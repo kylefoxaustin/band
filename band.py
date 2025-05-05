@@ -149,7 +149,7 @@ class StreamCopy(BandwidthTest):
     """STREAM Copy test: c = a"""
     
     def __init__(self, *args, **kwargs):
-        super().__init__("STREAM Copy", *args, **kwargs)
+        super().__init__("Py-STREAM Copy", *args, **kwargs)
     
     def _run_thread(self, arrays, thread_id):
         a, _, c = arrays
@@ -166,7 +166,7 @@ class StreamScale(BandwidthTest):
     """STREAM Scale test: b = scalar × c"""
     
     def __init__(self, *args, **kwargs):
-        super().__init__("STREAM Scale", *args, **kwargs)
+        super().__init__("Py-STREAM Scale", *args, **kwargs)
     
     def _run_thread(self, arrays, thread_id):
         _, b, c = arrays
@@ -184,7 +184,7 @@ class StreamAdd(BandwidthTest):
     """STREAM Add test: c = a + b"""
     
     def __init__(self, *args, **kwargs):
-        super().__init__("STREAM Add", *args, **kwargs)
+        super().__init__("Py-STREAM Add", *args, **kwargs)
         # Default optimal chunk size - can be overridden by command line
         if not kwargs.get('chunk_size_kb'):
             self.chunk_size = 4 * 1024 * 1024  # 4MB chunks
@@ -206,7 +206,7 @@ class StreamTriad(BandwidthTest):
     """STREAM Triad test: a = b + scalar × c"""
     
     def __init__(self, *args, **kwargs):
-        super().__init__("STREAM Triad", *args, **kwargs)
+        super().__init__("Py-STREAM Triad", *args, **kwargs)
         # Default optimal chunk size - can be overridden by command line
         if not kwargs.get('chunk_size_kb'):
             self.chunk_size = 4 * 1024 * 1024  # 4MB chunks
@@ -232,7 +232,7 @@ class ChunkedTriad(BandwidthTest):
     """Chunked Triad implementation with explicit temporaries"""
     
     def __init__(self, *args, **kwargs):
-        super().__init__("Chunked Triad", *args, **kwargs)
+        super().__init__("Py-Chunked Triad", *args, **kwargs)
         # Default optimal chunk size - can be overridden by command line
         if not kwargs.get('chunk_size_kb'):
             self.chunk_size = 512 * 1024  # 512KB chunks
@@ -264,7 +264,7 @@ class CombinedTriad(BandwidthTest):
     """Combined operation Triad: a = b + scalar * c"""
     
     def __init__(self, *args, **kwargs):
-        super().__init__("Combined Triad", *args, **kwargs)
+        super().__init__("Py-Combined Triad", *args, **kwargs)
         # Default optimal chunk size - can be overridden by command line
         if not kwargs.get('chunk_size_kb'):
             self.chunk_size = 8 * 1024 * 1024  # 8MB chunks
@@ -290,7 +290,7 @@ class MemcpyTest(BandwidthTest):
     """Memory copy test similar to MBW"""
     
     def __init__(self, *args, **kwargs):
-        super().__init__("MEMCPY", *args, **kwargs)
+        super().__init__("Py-MEMCPY", *args, **kwargs)
     
     def _run_thread(self, arrays, thread_id):
         a, b, _ = arrays
@@ -552,11 +552,11 @@ def main():
             print(f"{test_name}: {result['mean']:.2f} GB/s")
     
     # Compare triad implementations if available
-    if "STREAM Triad" in results and args.enable_chunking:
-        base_triad = results["STREAM Triad"]["mean"]
-        print("\nTriad Implementation Comparison (vs STREAM Triad):")
+    if "Py-STREAM Triad" in results and args.enable_chunking:
+        base_triad = results["Py-STREAM Triad"]["mean"]
+        print("\nTriad Implementation Comparison (vs Py-STREAM Triad):")
         for test_name, result in results.items():
-            if test_name != "STREAM Triad" and "Triad" in test_name:
+            if test_name != "Py-STREAM Triad" and "Triad" in test_name:
                 triad_result = result["mean"]
                 if base_triad > 0:
                     improvement = (triad_result / base_triad - 1) * 100
@@ -574,13 +574,13 @@ def main():
             if stream_file_valid:
                 # Map test names to STREAM-C operation names
                 operation_map = {
-                    "STREAM Copy": "Copy",
-                    "STREAM Scale": "Scale",
-                    "STREAM Add": "Add",
-                    "STREAM Triad": "Triad",
-                    "Chunked Triad": "Triad",
-                    "Combined Triad": "Triad",
-                    "MEMCPY": "Copy"
+                    "Py-STREAM Copy": "Copy",
+                    "Py-STREAM Scale": "Scale",
+                    "Py-STREAM Add": "Add",
+                    "Py-STREAM Triad": "Triad",
+                    "Py-Chunked Triad": "Triad",
+                    "Py-Combined Triad": "Triad",
+                    "Py-MEMCPY": "Copy"
                 }
                 
                 for test_name, result in results.items():
@@ -588,7 +588,7 @@ def main():
                         stream_value = stream_results[operation_map[test_name]]  # Already in MB/s
                         python_value = result["mean"] * 1024.0  # Convert GB/s to MB/s
                         ratio = python_value / stream_value * 100
-                        print(f"  {test_name}: {python_value:.2f} MB/s ({ratio:.1f}% of C {operation_map[test_name]} @ {stream_value:.2f} MB/s)")
+                        print(f"  Py-{test_name}: {python_value:.2f} MB/s ({ratio:.1f}% of STREAM.C {operation_map[test_name]} @ {stream_value:.2f} MB/s)")
             elif c_stream_triad > 0:
                 # Only compare Triad with command-line value
                 best_triad = 0
@@ -602,8 +602,8 @@ def main():
                     # Convert GB/s to MB/s for display
                     best_triad_mb = best_triad * 1024.0
                     ratio = best_triad_mb / c_stream_triad * 100
-                    print(f"  Best Python Triad ({best_name}) achieves {ratio:.1f}% of C STREAM Triad performance")
-                    print(f"  {best_name}: {best_triad_mb:.2f} MB/s vs C STREAM Triad: {c_stream_triad:.2f} MB/s")
+                    print(f"  Best Python Triad (Py-{best_name}) achieves {ratio:.1f}% of STREAM.C Triad performance")
+                    print(f"  Py-{best_name}: {best_triad_mb:.2f} MB/s vs STREAM.C Triad: {c_stream_triad:.2f} MB/s")
     
 
 if __name__ == "__main__":
