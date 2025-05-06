@@ -77,6 +77,29 @@ You can customize the execution with the following options:
 --enable-chunking      Enable chunked implementations that may benefit from CPU cache
 ```
 
+## Memory Size Recommendations
+
+BAND allocates memory based on the `--size` parameter, which defaults to 4GB. This can cause out-of-memory errors on systems with limited RAM. Below are recommended settings for different system configurations:
+
+### Recommended Size Settings
+
+| System Memory | Recommended Size | Command Example |
+|---------------|------------------|----------------|
+| 8GB or less   | 0.5GB or less    | `./band.py --size 0.5 --stream-file stream_results.txt` |
+| 16GB          | 1-2GB            | `./band.py --size 1.5 --stream-file stream_results.txt` |
+| 32GB          | 2-4GB            | `./band.py --size 3.0 --stream-file stream_results.txt` |
+| 64GB+         | 4-8GB            | `./band.py --size 6.0 --stream-file stream_results.txt` |
+
+### Memory Usage Guidelines
+
+- As a general rule, set the `--size` parameter to no more than 25-30% of your total available system memory
+- For embedded systems or SBCs (like Raspberry Pi, Jetson boards), use smaller values (0.1-0.5GB)
+- Larger test sizes can provide more accurate results for high-end systems, but aren't necessary for basic comparisons
+- Monitor memory usage with tools like `htop` or `free -h` while running tests
+- If you experience out-of-memory errors, reduce the size parameter
+
+Bandwidth results should be consistent regardless of test size, as long as the arrays are significantly larger than your CPU cache size. For most modern systems, even a 0.5GB test size is more than sufficient to exceed cache limits and measure true memory bandwidth.
+
 ## Explanation of CLI Options
 
 - **--size**: Total memory size to use for testing. Larger values provide more accurate results but require more RAM. Recommended to use at least 2-4 GB for meaningful results.
@@ -98,60 +121,6 @@ You can customize the execution with the following options:
 - **--stream-file**: Path to a file containing the output from a STREAM-C benchmark run. BAND will parse this file to extract all benchmark values for comprehensive comparison.
 
 - **--enable-chunking**: Enable cache-optimized implementations that use smaller chunk sizes for better cache utilization. By default, BAND uses standard implementations that match STREAM's approach of measuring pure memory bandwidth.
-
-## Effective Bandwidth Metrics
-
-When run, BAND provides composite bandwidth metrics that estimate real-world performance for different application types by weighting individual test results:
-
-### General Application Bandwidth Score
-
-This score estimates memory bandwidth for typical applications based on analysis of instruction mixes across various workloads:
-
-```
-General Score = (0.40 × Copy) + (0.25 × Scale) + (0.15 × Add) + (0.20 × Triad)
-```
-
-The weightings are derived from research on instruction frequencies in common applications, where:
-- Copy operations represent about 40% of memory accesses
-- Scale operations (multiply by scalar) represent about 25% 
-- Add operations represent about 15%
-- Complex operations like Triad represent about 20%
-
-### LLM Bandwidth Score
-
-This specialized metric estimates memory bandwidth for Large Language Model inference workloads, which have a distinct access pattern dominated by reads:
-
-```
-LLM Score = (0.90 × Copy) + (0.05 × Scale) + (0.025 × Add) + (0.025 × Triad)
-```
-
-LLMs are extremely read-heavy during inference, as they must retrieve vast numbers of parameters from memory while performing relatively fewer complex operations.
-
-### Adjusted Scores
-
-BAND also provides "adjusted" versions of both metrics where the Triad value is doubled to approximate the performance gap between Python and C implementations. This adjustment accounts for the observation that Python Triad implementations typically achieve around 50% of the performance of equivalent C implementations due to interpreter overhead.  An explanation of why this is the case is in the section ## Why Python Triad Performance Differs from STREAM.C
-
-### Example Output
-
-```
-BAND Effective Bandwidth Metrics:
------------------------------------
-Py-STREAM results:
-  - General application bandwidth score: 19.91 GB/s
-  - LLM bandwidth score:                24.31 GB/s
-
-Py-STREAM with doubled Triad (to match STREAM.C):
-  - General application bandwidth score: 21.95 GB/s
-  - LLM bandwidth score:                24.56 GB/s
-
-Calculation Explanation:
-  General score = (0.40 × Copy) + (0.25 × Scale) + (0.15 × Add) + (0.20 × Triad)
-  LLM score     = (0.90 × Copy) + (0.05 × Scale) + (0.025 × Add) + (0.025 × Triad)
-  * Adjusted scores use doubled Triad values to approximate STREAM.C performance
-  * Weightings based on instruction mix analysis of typical applications
-```
-
-These metrics provide more meaningful estimations of how memory bandwidth will affect real application performance compared to looking at individual test results in isolation.
 
 ## Memory Bandwidth Measurement Approaches
 
@@ -273,11 +242,18 @@ export OMP_NUM_THREADS=4  # Adjust based on your system
 
 ### Automated Comparison with STREAM-C Results
 
-To compare BAND results with the STREAM-C results:
+For more accurate and convenient comparison, BAND can automatically read STREAM-C results from an output file:
 
-```bash
-./band.py --stream-file stream_results.txt
-```
+1. **Save STREAM-C results to a file**:
+   ```bash
+   # Run STREAM-C and save output to a file
+   export OMP_NUM_THREADS=4 && ./stream_omp > stream_results.txt
+   ```
+
+2. **Run BAND with the results file**:
+   ```bash
+   ./band.py --stream-file stream_results.txt
+   ```
 
 This approach provides:
 - Comprehensive comparison using all measured operations (Copy, Scale, Add, Triad)
@@ -289,6 +265,60 @@ To include cache-optimized implementations in the comparison:
 ```bash
 ./band.py --stream-file stream_results.txt --enable-chunking
 ```
+
+## Effective Bandwidth Metrics
+
+BAND provides composite bandwidth metrics that estimate real-world performance for different application types by weighting individual test results:
+
+### General Application Bandwidth Score
+
+This score estimates memory bandwidth for typical applications based on analysis of instruction mixes across various workloads:
+
+```
+General Score = (0.40 × Copy) + (0.25 × Scale) + (0.15 × Add) + (0.20 × Triad)
+```
+
+The weightings are derived from research on instruction frequencies in common applications, where:
+- Copy operations represent about 40% of memory accesses
+- Scale operations (multiply by scalar) represent about 25% 
+- Add operations represent about 15%
+- Complex operations like Triad represent about 20%
+
+### LLM Bandwidth Score
+
+This specialized metric estimates memory bandwidth for Large Language Model inference workloads, which have a distinct access pattern dominated by reads:
+
+```
+LLM Score = (0.90 × Copy) + (0.05 × Scale) + (0.025 × Add) + (0.025 × Triad)
+```
+
+LLMs are extremely read-heavy during inference, as they must retrieve vast numbers of parameters from memory while performing relatively fewer complex operations.
+
+### Adjusted Scores
+
+BAND also provides "adjusted" versions of both metrics where the Triad value is doubled to approximate the performance gap between Python and C implementations. This adjustment accounts for the observation that Python Triad implementations typically achieve around 50% of the performance of equivalent C implementations due to interpreter overhead.
+
+### Example Output
+
+```
+BAND Effective Bandwidth Metrics:
+-----------------------------------
+Py-STREAM results:
+  - General application bandwidth score: 19.91 GB/s
+  - LLM bandwidth score:                24.31 GB/s
+
+Py-STREAM with doubled Triad (to match STREAM.C):
+  - General application bandwidth score: 21.95 GB/s
+  - LLM bandwidth score:                24.56 GB/s
+
+Calculation Explanation:
+  General score = (0.40 × Copy) + (0.25 × Scale) + (0.15 × Add) + (0.20 × Triad)
+  LLM score     = (0.90 × Copy) + (0.05 × Scale) + (0.025 × Add) + (0.025 × Triad)
+  * Adjusted scores use doubled Triad values to approximate STREAM.C performance
+  * Weightings based on instruction mix analysis of typical applications
+```
+
+These metrics provide more meaningful estimations of how memory bandwidth will affect real application performance compared to looking at individual test results in isolation.
 
 ## Example Results
 
@@ -358,23 +388,6 @@ Python vs C Comparison:
   Py-Chunked Triad: 14991.36 MB/s (74.9% of STREAM.C Triad @ 20014.90 MB/s)
   Py-Combined Triad: 11034.72 MB/s (55.1% of STREAM.C Triad @ 20014.90 MB/s)
 ```
-
-## Understanding the Results
-
-BAND provides several performance metrics:
-
-1. **Individual test results**: Raw bandwidth for each implementation in GB/s
-2. **Triad implementation comparison**: When using `--enable-chunking`, shows how different Triad implementations compare
-3. **Python vs C comparison**: Shows how each Python implementation compares to its C counterpart in MB/s and percentage
-
-Typically:
-- Py-STREAM Copy and Py-MEMCPY operations in Python achieve 90-105% of STREAM.C performance
-- Py-STREAM Scale operations achieve 85-100% of STREAM.C performance
-- Py-STREAM Add operations achieve 85-98% of STREAM.C performance
-- Standard Py-STREAM Triad operations achieve 50-60% of STREAM.C performance
-- Cache-optimized Py-Chunked Triad implementations can achieve 70-85% of STREAM.C performance
-
-The lower performance of standard Triad operations highlights NumPy's overhead in complex operations, while the significant improvement with cache optimization demonstrates the importance of cache-friendly code in Python.
 
 ## Why Python Triad Performance Differs from STREAM.C
 
