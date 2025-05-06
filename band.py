@@ -468,6 +468,7 @@ def calculate_effective_bandwidth(results):
             "llm": llm_weights
         }
     }
+
 def calculate_effective_bandwidth(results):
     """
     Calculate effective bandwidth scores for different application types
@@ -480,13 +481,14 @@ def calculate_effective_bandwidth(results):
         "Py-STREAM Triad": 0.20  # 20% weight for triad operations
     }
 
-    # LLM-specific weights based on memory access patterns in LLMs
+    # LLM-specific weights based on your specified values
     llm_weights = {
-        "Py-STREAM Copy": 0.70,  # 70% weight for copy operations (read-heavy)
-        "Py-STREAM Scale": 0.20,  # 20% weight for scale operations
-        "Py-STREAM Add": 0.05,   # 5% weight for add operations
-        "Py-STREAM Triad": 0.05  # 5% weight for triad operations
+        "Py-STREAM Copy": 0.90,  # 90% weight for copy operations (read-heavy)
+        "Py-STREAM Scale": 0.05,  # 5% weight for scale operations
+        "Py-STREAM Add": 0.025,   # 2.5% weight for add operations
+        "Py-STREAM Triad": 0.025  # 2.5% weight for triad operations
     }
+
 
     # Get benchmark results (falling back to 0 if test not run)
     copy_bw = results.get("Py-STREAM Copy", {}).get("mean", 0)
