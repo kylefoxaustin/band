@@ -99,6 +99,60 @@ You can customize the execution with the following options:
 
 - **--enable-chunking**: Enable cache-optimized implementations that use smaller chunk sizes for better cache utilization. By default, BAND uses standard implementations that match STREAM's approach of measuring pure memory bandwidth.
 
+## Effective Bandwidth Metrics
+
+When run, BAND provides composite bandwidth metrics that estimate real-world performance for different application types by weighting individual test results:
+
+### General Application Bandwidth Score
+
+This score estimates memory bandwidth for typical applications based on analysis of instruction mixes across various workloads:
+
+```
+General Score = (0.40 × Copy) + (0.25 × Scale) + (0.15 × Add) + (0.20 × Triad)
+```
+
+The weightings are derived from research on instruction frequencies in common applications, where:
+- Copy operations represent about 40% of memory accesses
+- Scale operations (multiply by scalar) represent about 25% 
+- Add operations represent about 15%
+- Complex operations like Triad represent about 20%
+
+### LLM Bandwidth Score
+
+This specialized metric estimates memory bandwidth for Large Language Model inference workloads, which have a distinct access pattern dominated by reads:
+
+```
+LLM Score = (0.90 × Copy) + (0.05 × Scale) + (0.025 × Add) + (0.025 × Triad)
+```
+
+LLMs are extremely read-heavy during inference, as they must retrieve vast numbers of parameters from memory while performing relatively fewer complex operations.
+
+### Adjusted Scores
+
+BAND also provides "adjusted" versions of both metrics where the Triad value is doubled to approximate the performance gap between Python and C implementations. This adjustment accounts for the observation that Python Triad implementations typically achieve around 50% of the performance of equivalent C implementations due to interpreter overhead.  An explanation of why this is the case is in the section ## Why Python Triad Performance Differs from STREAM.C
+
+### Example Output
+
+```
+BAND Effective Bandwidth Metrics:
+-----------------------------------
+Py-STREAM results:
+  - General application bandwidth score: 19.91 GB/s
+  - LLM bandwidth score:                24.31 GB/s
+
+Py-STREAM with doubled Triad (to match STREAM.C):
+  - General application bandwidth score: 21.95 GB/s
+  - LLM bandwidth score:                24.56 GB/s
+
+Calculation Explanation:
+  General score = (0.40 × Copy) + (0.25 × Scale) + (0.15 × Add) + (0.20 × Triad)
+  LLM score     = (0.90 × Copy) + (0.05 × Scale) + (0.025 × Add) + (0.025 × Triad)
+  * Adjusted scores use doubled Triad values to approximate STREAM.C performance
+  * Weightings based on instruction mix analysis of typical applications
+```
+
+These metrics provide more meaningful estimations of how memory bandwidth will affect real application performance compared to looking at individual test results in isolation.
+
 ## Memory Bandwidth Measurement Approaches
 
 BAND offers two approaches to measuring memory bandwidth:
