@@ -2,772 +2,948 @@
 """
 BAND: Bandwidth Assessment for Native DDR
 
-A memory bandwidth measurement tool for Python that provides results
-comparable to the STREAM benchmark. Includes optimized implementations
-for various memory operations with a focus on performance.
+A portable memory-bandwidth measurement tool.
+
+BAND measures sustained memory bandwidth using the four classic STREAM
+kernels (Copy, Scale, Add, Triad). It does so through a *tiered* set of
+backends and reports which tier produced each number, so you always know
+how close the figure is to true DRAM bandwidth:
+
+  Tier 0  NumPy        Always available. Pure Python + NumPy, no compiler,
+                       no privileges. Measures the bandwidth *achievable
+                       from Python*.
+  Tier 1  Native       Used when a C compiler is present. Compiles a small
+                       STREAM-style kernel at runtime and runs it with
+                       OpenMP. Measures bandwidth *achievable from native
+                       code* -- typically close to the hardware peak.
+  Tier 2  DRAM counters Used when privileged hardware counters are available
+                       (Linux uncore IMC via perf). Measures *actual DRAM
+                       traffic* at the memory controller, independent of
+                       read-for-ownership / non-temporal-store effects.
+
+In addition, a working-set sweep runs a single-core kernel across sizes from
+sub-L1 up past L3 and reports the bandwidth curve. The high-size plateau is a
+direct, *measured* estimate of per-core DRAM bandwidth -- no assumptions about
+cache size required.
+
+Units follow the STREAM convention: bandwidth is reported in decimal GB/s
+(1 GB = 1e9 bytes), so figures are directly comparable to STREAM.C output.
 """
 
-import numpy as np
-import time
 import argparse
+import ctypes
+import hashlib
 import os
-import multiprocessing
-import threading
-import psutil
 import platform
+import shutil
+import statistics
+import subprocess
+import tempfile
+import threading
 from datetime import datetime
-import gc
-import sys
+from time import perf_counter, sleep
 
-class BandwidthTest:
-    """Base class for bandwidth tests"""
+import numpy as np
 
-    def __init__(self, name, size_gb=1, threads=None, iterations=3, chunk_size_kb=None):
-        self.name = name
-        self.size_gb = size_gb
-        self.iterations = iterations
-        self.threads = threads if threads is not None else min(multiprocessing.cpu_count(), 4)
+try:
+    import psutil
+except ImportError:  # psutil is optional; only used for system info
+    psutil = None
 
-        # Calculate per-thread array sizes
-        self.thread_size_gb = self.size_gb / self.threads
-        self.elements_per_thread = int(self.thread_size_gb * 1024**3 / 8)  # 8 bytes per double
 
-        # Set chunk size - allow override from parameter
-        if chunk_size_kb:
-            self.chunk_size = chunk_size_kb * 1024  # Convert KB to bytes
-        else:
-            # Default chunk size - can be overridden in subclasses
-            self.chunk_size = 1024 * 1024  # 1MB chunks
+# --------------------------------------------------------------------------
+# Constants and operation definitions
+# --------------------------------------------------------------------------
 
-        # Results storage
-        self.results = []
+GB = 1_000_000_000          # decimal gigabyte (STREAM convention)
+ELEM_BYTES = 8              # float64
 
-    def _setup_data(self):
-        """Create data arrays for each thread"""
-        # Use a list to track arrays for each thread
-        thread_data = []
+# STREAM kernels. Array roles follow stream.c exactly:
+#   Copy : c = a              (read a, write c)
+#   Scale: b = scalar * c     (read c, write b)
+#   Add  : c = a + b          (read a, read b, write c)
+#   Triad: a = b + scalar*c   (read b, read c, write a)
+#
+# "bytes" is the logical traffic STREAM counts per element (reads + writes).
+OPERATIONS = {
+    "Copy":  {"bytes": 2 * ELEM_BYTES},
+    "Scale": {"bytes": 2 * ELEM_BYTES},
+    "Add":   {"bytes": 3 * ELEM_BYTES},
+    "Triad": {"bytes": 3 * ELEM_BYTES},
+}
+OP_ORDER = ["Copy", "Scale", "Add", "Triad"]
 
-        # Initialize arrays with proper values for the test
-        for _ in range(self.threads):
-            # Create arrays for each test
-            a = np.ones(self.elements_per_thread, dtype=np.float64)
-            b = np.ones(self.elements_per_thread, dtype=np.float64) * 2.0
-            c = np.zeros(self.elements_per_thread, dtype=np.float64)
-            thread_data.append((a, b, c))
+SCALAR = 3.0
+# Per-chunk temporary for the NumPy Triad. Sized to stay resident in L2 so the
+# temporary's traffic does not leak to DRAM (keeps logical == real traffic).
+NUMPY_TRIAD_CHUNK = 32 * 1024  # elements -> 256 KiB
 
-        return thread_data
 
-    def run(self):
-        """Run the benchmark with multiple threads"""
-        print(f"Running {self.name} test with {self.threads} threads, " +
-              f"{self.size_gb:.1f} GB total memory...")
+# --------------------------------------------------------------------------
+# Small helpers
+# --------------------------------------------------------------------------
 
-        # Force garbage collection before starting
-        gc.collect()
+def human_bytes(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024.0
 
-        # Prepare arrays
-        thread_data = self._setup_data()
 
-        # Warmup to ensure memory is allocated
-        self._warmup(thread_data)
+def available_cpus():
+    """Logical CPUs this process may run on (respects cgroup/affinity)."""
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            return sorted(os.sched_getaffinity(0))
+        except OSError:
+            pass
+    n = os.cpu_count() or 1
+    return list(range(n))
 
-        # Run multiple iterations
-        times = []
-        for i in range(self.iterations):
-            print(f"  Iteration {i+1}/{self.iterations}...", end="", flush=True)
 
-            # Start threads
-            threads = []
+def summarize(bandwidths):
+    """Reduce a list of per-iteration GB/s figures to summary stats."""
+    if not bandwidths:
+        return None
+    vals = list(bandwidths)
+    mean = statistics.fmean(vals)
+    stdev = statistics.pstdev(vals) if len(vals) > 1 else 0.0
+    return {
+        "median": statistics.median(vals),
+        "mean": mean,
+        "min": min(vals),
+        "max": max(vals),
+        "stdev": stdev,
+        "cv": (stdev / mean * 100.0) if mean else 0.0,
+        "n": len(vals),
+        "raw": vals,
+    }
 
-            # Let system settle for consistency
-            time.sleep(0.1)
-            gc.collect()
 
-            start_time = time.time()
+# --------------------------------------------------------------------------
+# System information
+# --------------------------------------------------------------------------
 
-            for t in range(self.threads):
-                thread = threading.Thread(
-                    target=self._run_thread,
-                    args=(thread_data[t], t)
-                )
-                thread.daemon = True
-                threads.append(thread)
-                thread.start()
-
-            # Wait for threads to complete
-            for thread in threads:
-                thread.join()
-
-            elapsed = time.time() - start_time
-
-            # Calculate bandwidth
-            total_bytes_processed = self._get_bytes_processed() * self.threads
-            bandwidth_gb_sec = total_bytes_processed / elapsed / (1024**3)
-
-            times.append(bandwidth_gb_sec)
-            print(f" {bandwidth_gb_sec:.2f} GB/s")
-
-        # Calculate statistics - exclude first iteration if we have multiple
-        if len(times) > 1:
-            times = times[1:]
-
-        if times:
-            self.results = {
-                "min": min(times),
-                "max": max(times),
-                "mean": sum(times) / len(times),
-                "raw": times
-            }
-
-            print(f"  {self.name} result: {self.results['mean']:.2f} GB/s " +
-                  f"(min: {self.results['min']:.2f}, max: {self.results['max']:.2f})")
-
-        return self.results
-
-    def _warmup(self, thread_data):
-        """Warm up memory access to ensure it's mapped"""
-        for arrays in thread_data:
-            a, b, c = arrays
-
-            # Touch every 1MB to ensure pages are mapped
-            stride = 131072  # 1MB worth of doubles
-            for i in range(0, len(a), stride):
-                a[i] = 1.0
-                b[i] = 2.0
-                c[i] = 0.0
-
-    def _run_thread(self, arrays, thread_id):
-        """Override in subclasses"""
+def detect_caches():
+    """Return a list of (level, type, size_bytes) from sysfs (Linux)."""
+    caches = []
+    base = "/sys/devices/system/cpu/cpu0/cache"
+    try:
+        for entry in sorted(os.listdir(base)):
+            d = os.path.join(base, entry)
+            try:
+                level = int(open(os.path.join(d, "level")).read().strip())
+                ctype = open(os.path.join(d, "type")).read().strip()
+                raw = open(os.path.join(d, "size")).read().strip()
+            except (OSError, ValueError):
+                continue
+            mult = 1
+            if raw.endswith("K"):
+                mult, raw = 1024, raw[:-1]
+            elif raw.endswith("M"):
+                mult, raw = 1024 * 1024, raw[:-1]
+            try:
+                caches.append((level, ctype, int(raw) * mult))
+            except ValueError:
+                continue
+    except OSError:
         pass
-
-    def _get_bytes_processed(self):
-        """Return bytes processed in one thread"""
-        return 0
-
-
-class StreamCopy(BandwidthTest):
-    """STREAM Copy test: c = a"""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__("Py-STREAM Copy", *args, **kwargs)
-
-    def _run_thread(self, arrays, thread_id):
-        a, _, c = arrays
-
-        # Use NumPy's optimized copy
-        np.copyto(c, a)
-
-    def _get_bytes_processed(self):
-        # Read from a, write to c = 2 operations
-        return 2 * 8 * self.elements_per_thread  # 2 arrays × 8 bytes × elements
-
-
-class StreamScale(BandwidthTest):
-    """STREAM Scale test: b = scalar × c"""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__("Py-STREAM Scale", *args, **kwargs)
-
-    def _run_thread(self, arrays, thread_id):
-        _, b, c = arrays
-        scalar = 3.0
-
-        # Full vectorized operation
-        np.multiply(c, scalar, out=b)
-
-    def _get_bytes_processed(self):
-        # Read from c, write to b = 2 operations
-        return 2 * 8 * self.elements_per_thread
-
-
-class StreamAdd(BandwidthTest):
-    """STREAM Add test: c = a + b"""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__("Py-STREAM Add", *args, **kwargs)
-        # Default optimal chunk size - can be overridden by command line
-        if not kwargs.get('chunk_size_kb'):
-            self.chunk_size = 4 * 1024 * 1024  # 4MB chunks
-
-    def _run_thread(self, arrays, thread_id):
-        a, b, c = arrays
-
-        # Process in optimally sized chunks
-        for i in range(0, len(c), self.chunk_size):
-            end = min(i + self.chunk_size, len(c))
-            np.add(a[i:end], b[i:end], out=c[i:end])
-
-    def _get_bytes_processed(self):
-        # Read from a and b, write to c = 3 operations
-        return 3 * 8 * self.elements_per_thread
-
-
-class StreamTriad(BandwidthTest):
-    """STREAM Triad test: a = b + scalar × c"""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__("Py-STREAM Triad", *args, **kwargs)
-        # Default optimal chunk size - can be overridden by command line
-        if not kwargs.get('chunk_size_kb'):
-            self.chunk_size = 4 * 1024 * 1024  # 4MB chunks
-
-    def _run_thread(self, arrays, thread_id):
-        a, b, c = arrays
-        scalar = 3.0
-
-        # Process in chunks for better cache behavior
-        for i in range(0, len(a), self.chunk_size):
-            end = min(i + self.chunk_size, len(a))
-
-            # Two separate operations to avoid temporary array creation
-            chunk_c = c[i:end] * scalar
-            a[i:end] = b[i:end] + chunk_c
-
-    def _get_bytes_processed(self):
-        # Read from b and c, write to a, with scalar multiplication = 3 operations
-        return 3 * 8 * self.elements_per_thread
-
-
-class ChunkedTriad(BandwidthTest):
-    """Chunked Triad implementation with explicit temporaries"""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__("Py-Chunked Triad", *args, **kwargs)
-        # Default optimal chunk size - can be overridden by command line
-        if not kwargs.get('chunk_size_kb'):
-            self.chunk_size = 512 * 1024  # 512KB chunks
-
-    def _run_thread(self, arrays, thread_id):
-        a, b, c = arrays
-        scalar = 3.0
-
-        # Create a reusable temporary array
-        temp = np.empty(self.chunk_size, dtype=np.float64)
-
-        # Process in small chunks with reused temporary
-        for i in range(0, len(a), self.chunk_size):
-            end = min(i + self.chunk_size, len(a))
-            chunk_size = end - i
-
-            # First compute scalar * c into temp
-            np.multiply(c[i:end], scalar, out=temp[:chunk_size])
-
-            # Then add b and store in a
-            np.add(b[i:end], temp[:chunk_size], out=a[i:end])
-
-    def _get_bytes_processed(self):
-        # Read from b and c, write to a, with scalar multiplication = 3 operations
-        return 3 * 8 * self.elements_per_thread
-
-
-class CombinedTriad(BandwidthTest):
-    """Combined operation Triad: a = b + scalar * c"""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__("Py-Combined Triad", *args, **kwargs)
-        # Default optimal chunk size - can be overridden by command line
-        if not kwargs.get('chunk_size_kb'):
-            self.chunk_size = 8 * 1024 * 1024  # 8MB chunks
-
-    def _run_thread(self, arrays, thread_id):
-        a, b, c = arrays
-        scalar = 3.0
-
-        # Process in chunks for better performance
-        for i in range(0, len(a), self.chunk_size):
-            end = min(i + self.chunk_size, len(a))
-
-            # Use numpy's ability to combine operations
-            # By using a single expression, NumPy can optimize better
-            a[i:end] = b[i:end] + scalar * c[i:end]
-
-    def _get_bytes_processed(self):
-        # Read from b and c, write to a, with scalar multiplication = 3 operations
-        return 3 * 8 * self.elements_per_thread
-
-
-class MemcpyTest(BandwidthTest):
-    """Memory copy test similar to MBW"""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__("Py-MEMCPY", *args, **kwargs)
-
-    def _run_thread(self, arrays, thread_id):
-        a, b, _ = arrays
-
-        # Use numpy's built-in copy for maximum performance
-        np.copyto(b, a)
-
-    def _get_bytes_processed(self):
-        # Read from a, write to b = 2 operations
-        return 2 * 8 * self.elements_per_thread
+    return caches
 
 
 def get_system_info():
-    """Collect system information"""
     info = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "system": platform.system(),
         "architecture": platform.machine(),
-        "processor": platform.processor(),
-        "cpu_count": multiprocessing.cpu_count(),
-        "memory_gb": psutil.virtual_memory().total / (1024**3)
+        "cpu_count": os.cpu_count() or 1,
+        "available_cpus": len(available_cpus()),
     }
+    if psutil is not None:
+        info["memory_gb"] = psutil.virtual_memory().total / (1024 ** 3)
 
-    # Try to get CPU model from /proc/cpuinfo
     try:
-        with open('/proc/cpuinfo', 'r') as f:
+        with open("/proc/cpuinfo") as f:
             for line in f:
-                if 'model name' in line:
-                    info["cpu_model"] = line.split(':')[1].strip()
+                if "model name" in line:
+                    info["cpu_model"] = line.split(":", 1)[1].strip()
                     break
-    except:
+    except OSError:
         pass
 
-    # Try to get memory information
-    try:
-        if platform.system() == "Linux":
-            with open('/proc/meminfo', 'r') as f:
-                for line in f:
-                    if 'MemTotal' in line:
-                        mem_kb = int(line.split()[1])
-                        info["memory_total_kb"] = mem_kb
-                        break
-    except:
-        pass
-
+    info["caches"] = detect_caches()
     return info
 
 
-def parse_stream_file(filename):
+def largest_cache_bytes(caches):
+    return max((sz for _, _, sz in caches), default=0)
+
+
+# --------------------------------------------------------------------------
+# Tier 0: NumPy backend
+# --------------------------------------------------------------------------
+
+def _numpy_kernel(op, a, b, c, tmp):
+    """Run one STREAM kernel on the given (per-thread) arrays, in place."""
+    if op == "Copy":
+        np.copyto(c, a)
+    elif op == "Scale":
+        np.multiply(c, SCALAR, out=b)
+    elif op == "Add":
+        np.add(a, b, out=c)
+    elif op == "Triad":
+        # a = b + scalar*c, computed chunk-wise with a cache-resident temp so
+        # no large intermediate array is allocated (which would otherwise
+        # dominate the measurement -- the classic NumPy-Triad pitfall).
+        n = a.shape[0]
+        step = tmp.shape[0]
+        for i in range(0, n, step):
+            j = min(i + step, n)
+            k = j - i
+            np.multiply(c[i:j], SCALAR, out=tmp[:k])
+            np.add(b[i:j], tmp[:k], out=a[i:j])
+    else:
+        raise ValueError(f"unknown op {op}")
+
+
+class NumpyPool:
+    """Persistent pool of pinned worker threads sharing barrier-synced work.
+
+    Threads are created once, pinned to distinct CPUs, and each allocates and
+    first-touches its own array slice (so pages land on the local NUMA node).
+    `run_once` triggers one synchronized pass and returns the wall-clock time.
     """
-    Parse a STREAM benchmark output file to extract benchmark results.
 
-    Args:
-        filename (str): Path to the file containing STREAM output
+    def __init__(self, total_elems, threads, pin=True):
+        self.threads = threads
+        self.pin = pin and hasattr(os, "sched_setaffinity")
+        self.cpus = available_cpus()
 
-    Returns:
-        dict: Dictionary with benchmark results for Copy, Scale, Add, and Triad operations
-        bool: Success status of parsing operation
-    """
-    results = {
-        "Copy": None,
-        "Scale": None,
-        "Add": None,
-        "Triad": None
-    }
+        base = total_elems // threads
+        rem = total_elems - base * threads
+        self.slice_sizes = [base + (1 if i < rem else 0) for i in range(threads)]
+        self.total_elems = total_elems
 
+        self._cmd = None
+        self._stop = False
+        self._alloc_err = [None] * threads
+        self._start = threading.Barrier(threads + 1)
+        self._end = threading.Barrier(threads + 1)
+        self._ready = threading.Barrier(threads + 1)
+
+        self._workers = []
+        for tid in range(threads):
+            t = threading.Thread(target=self._worker, args=(tid,), daemon=True)
+            t.start()
+            self._workers.append(t)
+        self._ready.wait()  # wait for all allocations to complete
+        err = next((e for e in self._alloc_err if e), None)
+        if err:
+            raise err
+
+    def _worker(self, tid):
+        if self.pin and self.cpus:
+            try:
+                os.sched_setaffinity(0, {self.cpus[tid % len(self.cpus)]})
+            except OSError:
+                pass
+        try:
+            n = self.slice_sizes[tid]
+            a = np.ones(n, dtype=np.float64)
+            b = np.full(n, 2.0, dtype=np.float64)
+            c = np.zeros(n, dtype=np.float64)
+            tmp = np.empty(min(n, NUMPY_TRIAD_CHUNK) or 1, dtype=np.float64)
+        except Exception as exc:  # noqa: BLE001 - report allocation failures
+            self._alloc_err[tid] = exc
+            self._ready.wait()
+            return
+        self._ready.wait()
+
+        while True:
+            self._start.wait()
+            if self._stop:
+                return
+            _numpy_kernel(self._cmd, a, b, c, tmp)
+            self._end.wait()
+
+    def run_once(self, op):
+        self._cmd = op
+        t0 = perf_counter()
+        self._start.wait()
+        self._end.wait()
+        return perf_counter() - t0
+
+    def close(self):
+        self._stop = True
+        try:
+            self._start.wait()
+        except threading.BrokenBarrierError:
+            pass
+
+
+def measure_numpy(op, total_elems, threads, iterations, pin=True):
+    """Return summary stats (GB/s) for one op via the NumPy backend."""
+    pool = NumpyPool(total_elems, threads, pin=pin)
     try:
-        with open(filename, 'r') as f:
+        pool.run_once(op)  # warm-up (not recorded)
+        bw = []
+        for _ in range(iterations):
+            elapsed = pool.run_once(op)
+            if elapsed > 0:
+                bytes_moved = OPERATIONS[op]["bytes"] * total_elems
+                bw.append(bytes_moved / elapsed / GB)
+    finally:
+        pool.close()
+    return summarize(bw)
+
+
+# --------------------------------------------------------------------------
+# Tier 1: Native (runtime-compiled C) backend
+# --------------------------------------------------------------------------
+
+_NATIVE_SOURCE = r"""
+#include <stdlib.h>
+#include <stdio.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+typedef struct { double *a, *b, *c; long n; } band_state;
+
+static double now(void) {
+#ifdef _OPENMP
+    return omp_get_wtime();
+#else
+    return (double)clock() / CLOCKS_PER_SEC;
+#endif
+}
+
+band_state* band_init(long n) {
+    band_state* s = (band_state*)malloc(sizeof(band_state));
+    if (!s) return NULL;
+    s->n = n;
+    s->a = (double*)aligned_alloc(64, (size_t)n * sizeof(double));
+    s->b = (double*)aligned_alloc(64, (size_t)n * sizeof(double));
+    s->c = (double*)aligned_alloc(64, (size_t)n * sizeof(double));
+    if (!s->a || !s->b || !s->c) { return s; }
+    /* Parallel first-touch so pages land on the node that will use them. */
+    #pragma omp parallel for
+    for (long i = 0; i < n; i++) { s->a[i] = 1.0; s->b[i] = 2.0; s->c[i] = 0.0; }
+    return s;
+}
+
+void band_free(band_state* s) {
+    if (!s) return;
+    free(s->a); free(s->b); free(s->c); free(s);
+}
+
+/* op: 0=Copy 1=Scale 2=Add 3=Triad. Returns the minimum elapsed time (s). */
+double band_run(band_state* s, int op, int reps) {
+    const double scalar = 3.0;
+    long n = s->n;
+    double *a = s->a, *b = s->b, *c = s->c;
+    double best = 1e300;
+    for (int r = 0; r < reps; r++) {
+        double t0 = now();
+        switch (op) {
+        case 0:
+            #pragma omp parallel for
+            for (long i = 0; i < n; i++) c[i] = a[i];
+            break;
+        case 1:
+            #pragma omp parallel for
+            for (long i = 0; i < n; i++) b[i] = scalar * c[i];
+            break;
+        case 2:
+            #pragma omp parallel for
+            for (long i = 0; i < n; i++) c[i] = a[i] + b[i];
+            break;
+        case 3:
+            #pragma omp parallel for
+            for (long i = 0; i < n; i++) a[i] = b[i] + scalar * c[i];
+            break;
+        }
+        double dt = now() - t0;
+        if (dt < best) best = dt;
+    }
+    return best;
+}
+
+void band_set_threads(int t) {
+#ifdef _OPENMP
+    omp_set_num_threads(t);
+#else
+    (void)t;
+#endif
+}
+"""
+
+
+def _find_compiler():
+    for cc in ("cc", "gcc", "clang"):
+        path = shutil.which(cc)
+        if path:
+            return path
+    return None
+
+
+class NativeBackend:
+    """Compiles and loads the native STREAM kernel; None if unavailable."""
+
+    def __init__(self, lib_path, threads):
+        self._lib = ctypes.CDLL(lib_path)
+        self._lib.band_init.restype = ctypes.c_void_p
+        self._lib.band_init.argtypes = [ctypes.c_long]
+        self._lib.band_free.argtypes = [ctypes.c_void_p]
+        self._lib.band_run.restype = ctypes.c_double
+        self._lib.band_run.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        self._lib.band_set_threads.argtypes = [ctypes.c_int]
+        self._threads = threads
+        self._lib.band_set_threads(threads)
+
+    @classmethod
+    def build(cls, threads, openmp=True, verbose=False):
+        cc = _find_compiler()
+        if not cc:
+            return None, "no C compiler found (looked for cc/gcc/clang)"
+
+        base_flags = ["-O3", "-fPIC", "-shared", "-funroll-loops"]
+        # -march=native helps the compiler emit wide SIMD / streaming stores.
+        march = ["-march=native"]
+        omp = ["-fopenmp"] if openmp else []
+
+        cache_dir = os.path.join(tempfile.gettempdir(), "band_native")
+        os.makedirs(cache_dir, exist_ok=True)
+        key = hashlib.sha1(
+            (_NATIVE_SOURCE + cc + " ".join(base_flags + march + omp)
+             + platform.platform()).encode()
+        ).hexdigest()[:16]
+        lib_path = os.path.join(cache_dir, f"band_{key}.so")
+        src_path = os.path.join(cache_dir, f"band_{key}.c")
+
+        if not os.path.exists(lib_path):
+            with open(src_path, "w") as f:
+                f.write(_NATIVE_SOURCE)
+            # Try with -march=native first, then without (some toolchains/VMs
+            # reject it), then without OpenMP.
+            attempts = [
+                [cc, *base_flags, *march, *omp, src_path, "-o", lib_path],
+                [cc, *base_flags, *omp, src_path, "-o", lib_path],
+                [cc, *base_flags, src_path, "-o", lib_path],
+            ]
+            last_err = ""
+            for cmd in attempts:
+                try:
+                    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    last_err = str(exc)
+                    continue
+                if r.returncode == 0 and os.path.exists(lib_path):
+                    if verbose:
+                        print(f"  (compiled with: {' '.join(cmd)})")
+                    break
+                last_err = r.stderr.strip().splitlines()[-1] if r.stderr.strip() else "unknown error"
+            else:
+                return None, f"compilation failed: {last_err}"
+
+        try:
+            return cls(lib_path, threads), None
+        except OSError as exc:
+            return None, f"could not load compiled library: {exc}"
+
+    def measure(self, op, per_array_elems, reps):
+        op_idx = {"Copy": 0, "Scale": 1, "Add": 2, "Triad": 3}[op]
+        state = self._lib.band_init(ctypes.c_long(per_array_elems))
+        if not state:
+            raise MemoryError("native band_init failed (out of memory?)")
+        try:
+            best = self._lib.band_run(ctypes.c_void_p(state), op_idx, reps)
+        finally:
+            self._lib.band_free(ctypes.c_void_p(state))
+        if best <= 0:
+            return None
+        bw = OPERATIONS[op]["bytes"] * per_array_elems / best / GB
+        # Native backend reports best-of-reps as a single robust figure.
+        return summarize([bw])
+
+    def make_driver(self, op, per_array_elems):
+        """Return a driver_fn(stop_event) that runs `op` until stopped.
+
+        Used to drive the Tier 2 counting window with the native kernel, which
+        sustains memory traffic closer to the hardware ceiling than NumPy.
+        """
+        op_idx = {"Copy": 0, "Scale": 1, "Add": 2, "Triad": 3}[op]
+        lib = self._lib
+        nthreads = self._threads
+
+        def driver(stop):
+            # OpenMP's thread-count ICV is per-thread; set it here so the kernel
+            # runs multi-threaded on this (spawned) driver thread, not on the
+            # single thread inherited from OMP_NUM_THREADS=1.
+            lib.band_set_threads(nthreads)
+            state = lib.band_init(ctypes.c_long(per_array_elems))
+            if not state:
+                return
+            try:
+                while not stop.is_set():
+                    lib.band_run(ctypes.c_void_p(state), op_idx, 8)
+            finally:
+                lib.band_free(ctypes.c_void_p(state))
+
+        return driver
+
+
+# --------------------------------------------------------------------------
+# Tier 2: DRAM counters (Linux uncore IMC via perf)
+# --------------------------------------------------------------------------
+
+# Candidate IMC event sets, probed in order. Names vary by microarchitecture:
+# client (desktop/laptop) free-running counters, per-controller CAS counts, and
+# older generic spellings. The first set perf actually returns numbers for wins.
+_PERF_EVENT_SETS = [
+    ("imc-free-running", ["uncore_imc_free_running/data_read/",
+                          "uncore_imc_free_running/data_write/"]),
+    ("imc-cas", ["unc_m_cas_count_rd", "unc_m_cas_count_wr"]),
+    ("imc-cas-slash", ["uncore_imc/cas_count_read/", "uncore_imc/cas_count_write/"]),
+    ("imc-data-slash", ["uncore_imc/data_reads/", "uncore_imc/data_writes/"]),
+]
+
+# perf may report a pre-scaled unit (e.g. "MiB") or a raw event count. Map the
+# unit to bytes; an empty/unknown unit means a raw CAS-style count (64 B/line).
+_UNIT_BYTES = {"B": 1, "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3,
+               "KB": 1e3, "MB": 1e6, "GB": 1e9}
+
+
+def _counter_to_bytes(value, unit):
+    unit = (unit or "").strip()
+    if unit in _UNIT_BYTES:
+        return value * _UNIT_BYTES[unit]
+    return value * 64  # raw cache-line count
+
+
+def _perf_available():
+    if platform.system() != "Linux":
+        return False, "DRAM counters supported on Linux only"
+    if not shutil.which("perf"):
+        return False, "perf not installed"
+    try:
+        paranoid = int(open("/proc/sys/kernel/perf_event_paranoid").read().strip())
+    except (OSError, ValueError):
+        paranoid = None
+    if paranoid is not None and paranoid > 0 and os.geteuid() != 0:
+        return False, (f"perf_event_paranoid={paranoid} blocks uncore counters; "
+                       "rerun with sudo or set it to 0")
+    return True, None
+
+
+def _parse_perf_bytes(stderr, events):
+    """Sum DRAM bytes from perf -x, output for the given event names."""
+    total, found = 0.0, 0
+    for line in stderr.splitlines():
+        parts = line.split(",")
+        if len(parts) < 3 or parts[2] not in events:
+            continue
+        try:
+            val = float(parts[0].replace(" ", ""))
+        except ValueError:
+            continue  # "<not supported>" / "<not counted>"
+        total += _counter_to_bytes(val, parts[1])
+        found += 1
+    return total, found
+
+
+def _probe_perf_events():
+    """Find an IMC event set perf actually returns numeric values for."""
+    for label, events in _PERF_EVENT_SETS:
+        cmd = ["perf", "stat", "-a", "-x", ",", "-e", ",".join(events),
+               "--", "sleep", "0.3"]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        _, found = _parse_perf_bytes(r.stderr, events)
+        if found:
+            return label, events
+    return None
+
+
+def measure_dram_counters_live(driver_fn, duration, event_set):
+    """Count system-wide DRAM traffic while a workload saturates memory.
+
+    `driver_fn(stop_event)` runs a saturating workload in this process until
+    `stop_event` is set. perf counts all DRAM traffic system-wide over a fixed
+    window, so the result reflects true bus traffic (including read-for-ownership).
+    """
+    label, events = event_set
+    stop = threading.Event()
+
+    th = threading.Thread(target=driver_fn, args=(stop,), daemon=True)
+    th.start()
+    sleep(0.3)  # reach steady state before the counting window opens
+
+    cmd = ["perf", "stat", "-a", "-x", ",", "-e", ",".join(events),
+           "--", "sleep", str(duration)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=duration + 60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        stop.set()
+        th.join(timeout=5)
+        return None, f"perf run failed: {exc}"
+
+    stop.set()
+    th.join(timeout=5)
+
+    total_bytes, found = _parse_perf_bytes(r.stderr, events)
+    if found == 0:
+        return None, "no counter values parsed from perf output"
+    return {"bandwidth": total_bytes / duration / GB, "label": label,
+            "total_gb": total_bytes / GB}, None
+
+
+# --------------------------------------------------------------------------
+# Working-set sweep
+# --------------------------------------------------------------------------
+
+def working_set_sweep(max_array_bytes, reps_target_bytes=128 * 1024 * 1024):
+    """Single-core Copy bandwidth across array sizes (cache hierarchy curve).
+
+    Returns a list of (array_bytes, gb_per_s). The plateau at large sizes is a
+    measured estimate of single-core DRAM bandwidth.
+    """
+    saved_affinity = None
+    if hasattr(os, "sched_setaffinity") and available_cpus():
+        try:
+            saved_affinity = os.sched_getaffinity(0)
+            os.sched_setaffinity(0, {available_cpus()[0]})
+        except OSError:
+            saved_affinity = None
+
+    max_elems = max(max_array_bytes // ELEM_BYTES, 1024)
+    a = np.ones(max_elems, dtype=np.float64)
+    c = np.empty(max_elems, dtype=np.float64)
+
+    results = []
+    size = 2 * 1024  # start at 2 KiB per array
+    while size * ELEM_BYTES <= max_array_bytes:
+        n = size
+        reps = max(3, int(reps_target_bytes / (n * ELEM_BYTES)))
+        av, cv = a[:n], c[:n]
+        np.copyto(cv, av)  # warm
+        best = 1e300
+        for _ in range(reps):
+            t0 = perf_counter()
+            np.copyto(cv, av)
+            dt = perf_counter() - t0
+            if dt < best:
+                best = dt
+        if best > 0:
+            bw = OPERATIONS["Copy"]["bytes"] * n / best / GB
+            results.append((n * ELEM_BYTES, bw))
+        size *= 2
+
+    if saved_affinity is not None:
+        try:
+            os.sched_setaffinity(0, saved_affinity)
+        except OSError:
+            pass
+    return results
+
+
+# --------------------------------------------------------------------------
+# Reporting
+# --------------------------------------------------------------------------
+
+def print_op_table(title, results, note=None):
+    print(f"\n{title}")
+    print("-" * len(title))
+    if note:
+        print(f"  {note}")
+    print(f"  {'Operation':<8} {'GB/s':>9} {'min':>9} {'max':>9} {'cv%':>6}")
+    for op in OP_ORDER:
+        s = results.get(op)
+        if not s:
+            continue
+        warn = "  <- high variance" if s["cv"] > 5.0 else ""
+        print(f"  {op:<8} {s['median']:>9.2f} {s['min']:>9.2f} "
+              f"{s['max']:>9.2f} {s['cv']:>6.1f}{warn}")
+
+
+def print_sweep(results, caches):
+    if not results:
+        return
+    print("\nWorking-set sweep (single core, Copy kernel)")
+    print("-" * 43)
+    print("  Bandwidth vs per-array size. Plateau at large sizes ~= per-core")
+    print("  DRAM bandwidth; peaks at small sizes show cache bandwidth.")
+    cache_sizes = sorted(sz for lvl, t, sz in caches if t != "Instruction")
+    print(f"\n  {'array size':>11} {'GB/s':>9}  bar")
+    peak = max(bw for _, bw in results) if results else 1.0
+    for size, bw in results:
+        bar = "#" * int(round(bw / peak * 40))
+        marker = ""
+        for sz in cache_sizes:
+            if size > sz >= size // 2:
+                marker = f"  <~ exceeds {human_bytes(sz)} cache"
+        print(f"  {human_bytes(size):>11} {bw:>9.2f}  {bar}{marker}")
+    # Plateau estimate: mean of the largest few points.
+    tail = [bw for _, bw in results[-3:]]
+    if tail:
+        print(f"\n  Estimated per-core DRAM bandwidth (plateau): "
+              f"{statistics.fmean(tail):.2f} GB/s")
+
+
+def parse_stream_file(filename):
+    """Parse STREAM.C output; returns ({op: MB_per_s}, ok)."""
+    results = {"Copy": None, "Scale": None, "Add": None, "Triad": None}
+    try:
+        with open(filename) as f:
             content = f.readlines()
-
-        # Find the results table
-        table_start = -1
-        for i, line in enumerate(content):
-            if "Function" in line and "Best Rate MB/s" in line:
-                table_start = i + 1
-                break
-
-        if table_start == -1:
-            print(f"Warning: Could not find results table in {filename}")
-            return results, False
-
-        # Parse the next 4 lines for Copy, Scale, Add, Triad results
-        for i in range(4):
-            if table_start + i < len(content):
-                line = content[table_start + i]
-                parts = line.split()
-
-                # Expected format: "Copy: 25698.6 0.062431 0.062260 0.062579"
-                if len(parts) >= 2 and parts[0].rstrip(':') in results:
-                    op_name = parts[0].rstrip(':')
-                    try:
-                        results[op_name] = float(parts[1])
-                    except ValueError:
-                        print(f"Warning: Could not parse value for {op_name}: {parts[1]}")
-
-        # Verify we found all values
-        missing = [op for op, val in results.items() if val is None]
-        if missing:
-            print(f"Warning: Could not find results for: {', '.join(missing)}")
-            if len(missing) == len(results):  # If all values are missing
-                return results, False
-
-        return results, True
-
-    except Exception as e:
-        print(f"Error parsing STREAM file {filename}: {str(e)}")
+    except OSError as exc:
+        print(f"Error reading STREAM file {filename}: {exc}")
         return results, False
 
-def calculate_effective_bandwidth(results):
-    """
-    Calculate effective bandwidth scores for different application types
-    """
-    # General application weights based on instruction mix research
-    general_weights = {
-        "Py-STREAM Copy": 0.40,  # 40% weight for copy operations
-        "Py-STREAM Scale": 0.25,  # 25% weight for scale operations
-        "Py-STREAM Add": 0.15,   # 15% weight for add operations
-        "Py-STREAM Triad": 0.20  # 20% weight for triad operations
-    }
+    start = -1
+    for i, line in enumerate(content):
+        if "Function" in line and "Best Rate MB/s" in line:
+            start = i + 1
+            break
+    if start == -1:
+        print(f"Warning: could not find results table in {filename}")
+        return results, False
 
-    # LLM-specific weights based on memory access patterns in LLMs
-    llm_weights = {
-        "Py-STREAM Copy": 0.70,  # 70% weight for copy operations (read-heavy)
-        "Py-STREAM Scale": 0.20,  # 20% weight for scale operations
-        "Py-STREAM Add": 0.05,   # 5% weight for add operations
-        "Py-STREAM Triad": 0.05  # 5% weight for triad operations
-    }
-
-    # Get benchmark results (falling back to 0 if test not run)
-    copy_bw = results.get("Py-STREAM Copy", {}).get("mean", 0)
-    scale_bw = results.get("Py-STREAM Scale", {}).get("mean", 0)
-    add_bw = results.get("Py-STREAM Add", {}).get("mean", 0)
-    triad_bw = results.get("Py-STREAM Triad", {}).get("mean", 0)
-
-    # Calculate general application effective bandwidth
-    general_bw = (
-        general_weights["Py-STREAM Copy"] * copy_bw +
-        general_weights["Py-STREAM Scale"] * scale_bw +
-        general_weights["Py-STREAM Add"] * add_bw +
-        general_weights["Py-STREAM Triad"] * triad_bw
-    )
-
-    # Calculate LLM-specific effective bandwidth
-    llm_bw = (
-        llm_weights["Py-STREAM Copy"] * copy_bw +
-        llm_weights["Py-STREAM Scale"] * scale_bw +
-        llm_weights["Py-STREAM Add"] * add_bw +
-        llm_weights["Py-STREAM Triad"] * triad_bw
-    )
-
-    # Calculate with doubled Triad (to match STREAM.C implementation)
-    doubled_triad = triad_bw * 2  # Assume Python Triad is ~50% of C Triad
-
-    general_bw_adjusted = (
-        general_weights["Py-STREAM Copy"] * copy_bw +
-        general_weights["Py-STREAM Scale"] * scale_bw +
-        general_weights["Py-STREAM Add"] * add_bw +
-        general_weights["Py-STREAM Triad"] * doubled_triad
-    )
-
-    llm_bw_adjusted = (
-        llm_weights["Py-STREAM Copy"] * copy_bw +
-        llm_weights["Py-STREAM Scale"] * scale_bw +
-        llm_weights["Py-STREAM Add"] * add_bw +
-        llm_weights["Py-STREAM Triad"] * doubled_triad
-    )
-
-    return {
-        "general": general_bw,
-        "llm": llm_bw,
-        "general_adjusted": general_bw_adjusted,
-        "llm_adjusted": llm_bw_adjusted,
-        "weights": {
-            "general": general_weights,
-            "llm": llm_weights
-        }
-    }
-
-def calculate_effective_bandwidth(results):
-    """
-    Calculate effective bandwidth scores for different application types
-    """
-    # General application weights based on instruction mix research
-    general_weights = {
-        "Py-STREAM Copy": 0.40,  # 40% weight for copy operations
-        "Py-STREAM Scale": 0.25,  # 25% weight for scale operations
-        "Py-STREAM Add": 0.15,   # 15% weight for add operations
-        "Py-STREAM Triad": 0.20  # 20% weight for triad operations
-    }
-
-    # LLM-specific weights based on your specified values
-    llm_weights = {
-        "Py-STREAM Copy": 0.90,  # 90% weight for copy operations (read-heavy)
-        "Py-STREAM Scale": 0.05,  # 5% weight for scale operations
-        "Py-STREAM Add": 0.025,   # 2.5% weight for add operations
-        "Py-STREAM Triad": 0.025  # 2.5% weight for triad operations
-    }
+    for line in content[start:start + 4]:
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].rstrip(":") in results:
+            try:
+                results[parts[0].rstrip(":")] = float(parts[1])
+            except ValueError:
+                pass
+    ok = any(v is not None for v in results.values())
+    return results, ok
 
 
-    # Get benchmark results (falling back to 0 if test not run)
-    copy_bw = results.get("Py-STREAM Copy", {}).get("mean", 0)
-    scale_bw = results.get("Py-STREAM Scale", {}).get("mean", 0)
-    add_bw = results.get("Py-STREAM Add", {}).get("mean", 0)
-    triad_bw = results.get("Py-STREAM Triad", {}).get("mean", 0)
+def print_stream_comparison(numpy_res, native_res, stream_mb):
+    print("\nComparison vs STREAM.C (decimal MB/s)")
+    print("-" * 37)
 
-    # Calculate general application effective bandwidth
-    general_bw = (
-        general_weights["Py-STREAM Copy"] * copy_bw +
-        general_weights["Py-STREAM Scale"] * scale_bw +
-        general_weights["Py-STREAM Add"] * add_bw +
-        general_weights["Py-STREAM Triad"] * triad_bw
-    )
+    def cell(v, ref):
+        if v is None:
+            return f"{'-':>13}"
+        if ref:
+            return f"{v:.0f} ({v / ref * 100:.0f}%)".rjust(13)
+        return f"{v:.0f}".rjust(13)
 
-    # Calculate LLM-specific effective bandwidth
-    llm_bw = (
-        llm_weights["Py-STREAM Copy"] * copy_bw +
-        llm_weights["Py-STREAM Scale"] * scale_bw +
-        llm_weights["Py-STREAM Add"] * add_bw +
-        llm_weights["Py-STREAM Triad"] * triad_bw
-    )
+    print(f"  {'Operation':<8} {'STREAM.C':>13} {'Native':>13} {'NumPy':>13}")
+    for op in OP_ORDER:
+        sc = stream_mb.get(op)
+        nat = native_res.get(op)["median"] * 1000 if native_res.get(op) else None
+        npv = numpy_res.get(op)["median"] * 1000 if numpy_res.get(op) else None
+        print(f"  {op:<8} {(f'{sc:.0f}' if sc else '-'):>13}"
+              f"{cell(nat, sc)}{cell(npv, sc)}")
+    print("  (percentages are share of STREAM.C; 1 GB/s = 1000 MB/s, decimal)")
 
-    # Calculate with doubled Triad (to match STREAM.C implementation)
-    doubled_triad = triad_bw * 2  # Assume Python Triad is ~50% of C Triad
 
-    general_bw_adjusted = (
-        general_weights["Py-STREAM Copy"] * copy_bw +
-        general_weights["Py-STREAM Scale"] * scale_bw +
-        general_weights["Py-STREAM Add"] * add_bw +
-        general_weights["Py-STREAM Triad"] * doubled_triad
-    )
-
-    llm_bw_adjusted = (
-        llm_weights["Py-STREAM Copy"] * copy_bw +
-        llm_weights["Py-STREAM Scale"] * scale_bw +
-        llm_weights["Py-STREAM Add"] * add_bw +
-        llm_weights["Py-STREAM Triad"] * doubled_triad
-    )
-
-    return {
-        "general": general_bw,
-        "llm": llm_bw,
-        "general_adjusted": general_bw_adjusted,
-        "llm_adjusted": llm_bw_adjusted,
-        "weights": {
-            "general": general_weights,
-            "llm": llm_weights
-        }
-    }
-
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="BAND: Bandwidth Assessment for Native DDR")
-    parser.add_argument("--size", type=float, default=4.0,
-                        help="Size in GB for each test (default: 4 GB)")
-    parser.add_argument("--iterations", type=int, default=3,
-                        help="Number of iterations per test (default: 3)")
-    parser.add_argument("--threads", type=int,
-                        default=min(multiprocessing.cpu_count(), 4),
-                        help=f"Number of threads (default: min(CPU count, 4))")
-    parser.add_argument("--chunk-size", type=int, default=None,
-                        help="Chunk size in KB for operations (default: varies by test)")
-    parser.add_argument("--triad-only", action="store_true",
-                        help="Run only the triad tests for optimization experiments")
-    parser.add_argument("--best", action="store_true",
-                        help="Run only the best implementation for each operation")
-    parser.add_argument("--compare", action="store_true",
-                        help="Compare to C STREAM benchmark results")
-    parser.add_argument("--c-stream-triad", type=float, default=19.98,
-                        help="C STREAM Triad result for comparison (default: 19.98 GB/s)")
+    parser = argparse.ArgumentParser(
+        description="BAND: Bandwidth Assessment for Native DDR",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--size", type=float, default=2.0,
+                        help="Total memory in GB used per test")
+    parser.add_argument("--iterations", type=int, default=7,
+                        help="Timed iterations per operation")
+    parser.add_argument("--threads", type=int, default=None,
+                        help="Threads (default: all available CPUs, capped at 8)")
+    parser.add_argument("--no-pin", action="store_true",
+                        help="Disable pinning threads to CPUs")
+
+    parser.add_argument("--no-numpy", action="store_true", help="Skip Tier 0 (NumPy)")
+    parser.add_argument("--no-native", action="store_true", help="Skip Tier 1 (native)")
+    parser.add_argument("--dram-counters", action="store_true",
+                        help="Attempt Tier 2 (DRAM counters via perf; needs privileges)")
+    parser.add_argument("--dram-driver", choices=("auto", "native", "numpy"),
+                        default="auto",
+                        help="Workload that drives the Tier 2 counting window "
+                             "(auto: native if available, else numpy)")
+    parser.add_argument("--no-sweep", action="store_true",
+                        help="Skip the working-set sweep")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Show compiler command and extra diagnostics")
+
     parser.add_argument("--stream-file", type=str, default=None,
-                        help="Path to STREAM benchmark output file for comparison")
-    parser.add_argument("--enable-chunking", action="store_true",
-                        help="Enable chunked implementations that may benefit from CPU cache")
+                        help="STREAM.C output file to compare against")
+
+    parser.add_argument("--peak-mts", type=float, default=None,
+                        help="Memory transfer rate in MT/s (e.g. 6000 for DDR5-6000) "
+                             "to report %% of theoretical peak")
+    parser.add_argument("--channels", type=int, default=None,
+                        help="Number of populated memory channels (for peak calc)")
+
     args = parser.parse_args()
 
-    # Try to set process priority higher for more consistent results
-    try:
-        if platform.system() == "Windows":
-            import psutil
-            p = psutil.Process(os.getpid())
-            p.nice(psutil.HIGH_PRIORITY_CLASS)
-        else:
-            os.nice(-10)  # Lower value means higher priority on Unix
-    except:
-        print("Warning: Could not set process priority")
+    # Keep NumPy's own threading off so our threads/OpenMP control parallelism.
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+                "OPENBLAS_NUM_THREADS"):
+        os.environ.setdefault(var, "1")
 
-    # Disable numpy threading to avoid oversubscription
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
-    os.environ["NUMEXPR_NUM_THREADS"] = "1"
-    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    avail = available_cpus()
+    threads = args.threads if args.threads else min(len(avail), 8)
+    pin = not args.no_pin
 
-    # Get STREAM results from file if provided
-    stream_results = {"Copy": None, "Scale": None, "Add": None, "Triad": None}
-    stream_file_valid = False
+    # --size is the total footprint across all three arrays (a, b, c), so the
+    # per-array element count is size / 3 / 8. Both tiers use the same value,
+    # giving identical working sets for a fair comparison.
+    per_array_elems = max(int(args.size * GB / 3 / ELEM_BYTES), 1 << 20)
+    total_elems = max(per_array_elems, threads * NUMPY_TRIAD_CHUNK)
+    per_array_native = per_array_elems
 
-    if args.stream_file:
-        print(f"\nReading STREAM benchmark results from {args.stream_file}")
-        stream_results, stream_file_valid = parse_stream_file(args.stream_file)
-
-        if stream_file_valid:
-            print("STREAM-C results detected:")
-            for op, val in stream_results.items():
-                if val is not None:
-                    print(f"  {op}: {val:.2f} MB/s")
-        else:
-            print("ERROR: Failed to parse STREAM benchmark file. Continuing without comparison.")
-            print("If you want to compare with STREAM-C, please check your file format or use --c-stream-triad option.")
-
-    # Use file-provided Triad value if available and valid, otherwise use command-line argument
-    c_stream_triad = stream_results["Triad"] if (stream_file_valid and stream_results["Triad"] is not None) else args.c_stream_triad
-
-    # Print system information
     info = get_system_info()
-    print("\nBAND: Bandwidth Assessment for Native DDR")
-    print("-" * 40)
-    print(f"System: {info['system']} {info['architecture']}")
-    if 'cpu_model' in info:
+    print("BAND: Bandwidth Assessment for Native DDR")
+    print("=" * 43)
+    print(f"System:    {info['system']} {info['architecture']}")
+    if "cpu_model" in info:
         print(f"Processor: {info['cpu_model']}")
-    print(f"CPU Cores: {info['cpu_count']}")
-    print(f"Memory: {info['memory_gb']:.1f} GB")
-    print(f"Test Size: {args.size:.1f} GB per test")
-    print(f"Threads: {args.threads}")
-    print(f"Iterations: {args.iterations}")
-    if args.chunk_size:
-        print(f"Chunk Size: {args.chunk_size} KB")
-    if args.enable_chunking:
-        print("Cache optimization: Enabled (using chunked implementations)")
-    print("")
+    print(f"CPUs:      {info['cpu_count']} ({info['available_cpus']} available)")
+    if "memory_gb" in info:
+        print(f"Memory:    {info['memory_gb']:.1f} GiB")
+    if info["caches"]:
+        cache_str = ", ".join(
+            f"L{lvl}{('i' if t == 'Instruction' else 'd' if t == 'Data' else '')}="
+            f"{human_bytes(sz)}" for lvl, t, sz in info["caches"])
+        print(f"Caches:    {cache_str}")
+    print(f"Test size: {args.size:.2f} GB total | threads: {threads} | "
+          f"pin: {'on' if pin else 'off'} | iters: {args.iterations}")
 
-    # Common kwargs for all tests
-    test_kwargs = {
-        'size_gb': args.size,
-        'threads': args.threads,
-        'iterations': args.iterations,
-        'chunk_size_kb': args.chunk_size
-    }
+    theoretical_peak = None
+    if args.peak_mts and args.channels:
+        # GB/s = MT/s * 8 bytes/transfer * channels / 1000 (decimal)
+        theoretical_peak = args.peak_mts * 8 * args.channels / 1000.0
+        print(f"Theoretical peak: {theoretical_peak:.1f} GB/s "
+              f"({args.peak_mts:.0f} MT/s x {args.channels} ch)")
 
-    # Adjust test selection based on arguments
-    if args.triad_only:
-        if args.best:
-            if args.enable_chunking:
-                tests = [
-                    ChunkedTriad(**test_kwargs)  # Best with chunking enabled
-                ]
+    numpy_results = {}
+    native_results = {}
+    native_backend = None  # shared by Tier 1 and Tier 2
+
+    # ---- Tier 0: NumPy ----
+    if not args.no_numpy:
+        print("\n[Tier 0] NumPy  (achievable from Python)")
+        for op in OP_ORDER:
+            print(f"  measuring {op}...", end="", flush=True)
+            try:
+                s = measure_numpy(op, total_elems, threads, args.iterations, pin=pin)
+                numpy_results[op] = s
+                print(f" {s['median']:.2f} GB/s")
+            except MemoryError:
+                print(" out of memory (reduce --size)")
+                break
+        print_op_table("Tier 0 (NumPy) results", numpy_results)
+
+    # ---- Tier 1: Native ----
+    if not args.no_native:
+        print("\n[Tier 1] Native  (achievable from compiled C + OpenMP)")
+        native_backend, err = NativeBackend.build(threads, verbose=args.verbose)
+        if native_backend is None:
+            print(f"  skipped: {err}")
+        else:
+            native_reps = max(args.iterations + 3, 10)
+            for op in OP_ORDER:
+                print(f"  measuring {op}...", end="", flush=True)
+                try:
+                    s = native_backend.measure(op, per_array_native, native_reps)
+                    native_results[op] = s
+                    print(f" {s['median']:.2f} GB/s")
+                except MemoryError:
+                    print(" out of memory (reduce --size)")
+                    break
+            print_op_table(
+                "Tier 1 (Native) results", native_results,
+                note="best-of-reps; -O3 -march=native, may use SIMD/streaming stores")
+
+    # ---- Working-set sweep ----
+    if not args.no_sweep:
+        llc = largest_cache_bytes(info["caches"]) or 32 * 1024 * 1024
+        max_array = min(max(llc * 8, 64 * 1024 * 1024), 512 * 1024 * 1024)
+        sweep = working_set_sweep(max_array)
+        print_sweep(sweep, info["caches"])
+
+    # ---- Tier 2: DRAM counters ----
+    if args.dram_counters:
+        print("\n[Tier 2] DRAM counters  (measured traffic at memory controller)")
+        ok, why = _perf_available()
+        if not ok:
+            print(f"  skipped: {why}")
+        else:
+            print("  probing uncore IMC events...", end="", flush=True)
+            event_set = _probe_perf_events()
+            if not event_set:
+                print(" none accepted on this CPU; skipped")
             else:
-                tests = [
-                    StreamTriad(**test_kwargs)  # Standard STREAM implementation
-                ]
+                print(f" using {event_set[0]} ({', '.join(event_set[1])})")
+
+                # Pick the workload that drives the counting window. The native
+                # kernel sustains traffic closest to the hardware ceiling; NumPy
+                # is the portable fallback.
+                want = args.dram_driver
+                if want in ("auto", "native") and native_backend is None:
+                    nb, _ = NativeBackend.build(threads, verbose=False)
+                    native_backend = nb
+                use_native = (want != "numpy") and native_backend is not None
+                if want == "native" and native_backend is None:
+                    print("  (native driver requested but unavailable; using NumPy)")
+                    use_native = False
+
+                pool = None
+                if use_native:
+                    driver_fn = native_backend.make_driver("Triad", per_array_native)
+                    driver_label = "native"
+                else:
+                    pool = NumpyPool(total_elems, threads, pin=pin)
+                    driver_label = "NumPy"
+
+                    def driver_fn(stop, _pool=pool):
+                        while not stop.is_set():
+                            _pool.run_once("Triad")
+                try:
+                    res, err = measure_dram_counters_live(driver_fn, 3.0, event_set)
+                finally:
+                    if pool is not None:
+                        pool.close()
+                if err:
+                    print(f"  skipped: {err}")
+                else:
+                    print(f"  measured DRAM bandwidth: {res['bandwidth']:.2f} GB/s "
+                          f"(saturating {driver_label} Triad workload)")
+                    print("  note: real bus traffic incl. read-for-ownership, so it")
+                    print("        can exceed the logical Tier 0/1 figures.")
+
+    # ---- STREAM.C comparison ----
+    if args.stream_file:
+        stream_mb, ok = parse_stream_file(args.stream_file)
+        if ok:
+            print_stream_comparison(numpy_results, native_results, stream_mb)
         else:
-            tests = [
-                StreamTriad(**test_kwargs),  # Always include standard implementation
-            ]
-            if args.enable_chunking:
-                # Only add chunked implementations if explicitly enabled
-                tests.extend([
-                    ChunkedTriad(**test_kwargs),
-                    CombinedTriad(**test_kwargs)
-                ])
-    elif args.best:
-        # Use only the best implementation for each operation
-        tests = [
-            StreamCopy(**test_kwargs),      # Best Copy
-            StreamScale(**test_kwargs),     # Best Scale
-            StreamAdd(**test_kwargs),       # Best Add
-        ]
-        if args.enable_chunking:
-            tests.append(ChunkedTriad(**test_kwargs))  # Best Triad with chunking
-        else:
-            tests.append(StreamTriad(**test_kwargs))   # Standard STREAM Triad
-    else:
-        # Default test selection - standard STREAM implementations
-        tests = [
-            StreamCopy(**test_kwargs),
-            StreamScale(**test_kwargs),
-            StreamAdd(**test_kwargs),
-            StreamTriad(**test_kwargs),
-            MemcpyTest(**test_kwargs)
-        ]
+            print(f"\nSTREAM.C comparison skipped (could not parse {args.stream_file})")
 
-        # Add chunked implementations only if explicitly enabled
-        if args.enable_chunking:
-            tests.extend([
-                ChunkedTriad(**test_kwargs),
-                CombinedTriad(**test_kwargs)
-            ])
-
-    # Run all tests
-    results = {}
-    for test in tests:
-        result = test.run()
-        results[test.name] = result
-        print("")  # Add spacing between tests
-
-    # Print summary
-    print("\nResults Summary")
-    print("-" * 14)
-    for test_name, result in results.items():
-        if result:
-            print(f"{test_name}: {result['mean']:.2f} GB/s")
-
-    # Compare triad implementations if available
-    if "Py-STREAM Triad" in results and args.enable_chunking:
-        base_triad = results["Py-STREAM Triad"]["mean"]
-        print("\nTriad Implementation Comparison (vs Py-STREAM Triad):")
-        for test_name, result in results.items():
-            if test_name != "Py-STREAM Triad" and "Triad" in test_name:
-                triad_result = result["mean"]
-                if base_triad > 0:
-                    improvement = (triad_result / base_triad - 1) * 100
-                    print(f"  {test_name}: {triad_result:.2f} GB/s ({improvement:+.1f}%)")
-
-    # Compare to C STREAM results if requested
-    if args.compare or args.stream_file:
-        if not args.compare and not stream_file_valid:
-            # Skip comparison if neither option is usable
-            print("\nC STREAM comparison skipped due to invalid file.")
-        else:
-            print("\nPython vs C Comparison:")
-
-            # Compare all operations if we have valid file data
-            if stream_file_valid:
-                # Map test names to STREAM-C operation names
-                operation_map = {
-                    "Py-STREAM Copy": "Copy",
-                    "Py-STREAM Scale": "Scale",
-                    "Py-STREAM Add": "Add",
-                    "Py-STREAM Triad": "Triad",
-                    "Py-Chunked Triad": "Triad",
-                    "Py-Combined Triad": "Triad",
-                    "Py-MEMCPY": "Copy"
-                }
-
-                for test_name, result in results.items():
-                    if test_name in operation_map and stream_results[operation_map[test_name]] is not None:
-                        stream_value = stream_results[operation_map[test_name]]  # Already in MB/s
-                        python_value = result["mean"] * 1024.0  # Convert GB/s to MB/s
-                        ratio = python_value / stream_value * 100
-                        print(f"  {test_name}: {python_value:.2f} MB/s ({ratio:.1f}% of STREAM.C {operation_map[test_name]} @ {stream_value:.2f} MB/s)")
-            elif c_stream_triad > 0:
-                # Only compare Triad with command-line value
-                best_triad = 0
-                best_name = ""
-                for test_name, result in results.items():
-                    if "Triad" in test_name and result["mean"] > best_triad:
-                        best_triad = result["mean"]
-                        best_name = test_name
-
-                if best_triad > 0:
-                    # Convert GB/s to MB/s for display
-                    best_triad_mb = best_triad * 1024.0
-                    ratio = best_triad_mb / c_stream_triad * 100
-                    print(f"  Best Python Triad ({best_name}) achieves {ratio:.1f}% of STREAM.C Triad performance")
-                    print(f"  {best_name}: {best_triad_mb:.2f} MB/s vs STREAM.C Triad: {c_stream_triad:.2f} MB/s")
-
-    # Calculate effective bandwidth metrics
-    if "Py-STREAM Triad" in results:
-        bandwidth_scores = calculate_effective_bandwidth(results)
-
-        print("\nBAND Effective Bandwidth Metrics:")
-        print("-" * 35)
-        print("Py-STREAM results:")
-        print(f"  - General application bandwidth score: {bandwidth_scores['general']:.2f} GB/s")
-        print(f"  - LLM bandwidth score:                {bandwidth_scores['llm']:.2f} GB/s")
-
-        print("\nPy-STREAM with doubled Triad (to match STREAM.C):")
-        print(f"  - General application bandwidth score: {bandwidth_scores['general_adjusted']:.2f} GB/s")
-        print(f"  - LLM bandwidth score:                {bandwidth_scores['llm_adjusted']:.2f} GB/s")
-
-        # Explanation of calculations
-        print("\nCalculation Explanation:")
-        print("  General score = (0.40 × Copy) + (0.25 × Scale) + (0.15 × Add) + (0.20 × Triad)")
-        print("  LLM score     = (0.70 × Copy) + (0.20 × Scale) + (0.05 × Add) + (0.05 × Triad)")
-        print("  * Adjusted scores use doubled Triad values to approximate STREAM.C performance")
-        print("  * Weightings based on instruction mix analysis of typical applications")
-
-
+    # ---- Summary ----
+    print("\n" + "=" * 43)
+    print("Summary (Triad, the most representative kernel)")
+    if numpy_results.get("Triad"):
+        print(f"  Tier 0 NumPy : {numpy_results['Triad']['median']:.2f} GB/s")
+    if native_results.get("Triad"):
+        print(f"  Tier 1 Native: {native_results['Triad']['median']:.2f} GB/s")
+    if theoretical_peak:
+        best = max((r["Triad"]["median"] for r in (native_results, numpy_results)
+                    if r.get("Triad")), default=0)
+        if best:
+            print(f"  Best Triad is {best/theoretical_peak*100:.0f}% of "
+                  f"theoretical peak ({theoretical_peak:.1f} GB/s)")
+    print("\nTier meaning: Tier 0 = what Python can reach; Tier 1 = what native")
+    print("code can reach (~hardware achievable); Tier 2 = true DRAM traffic.")
 
 
 if __name__ == "__main__":
