@@ -1,3 +1,2 @@
 numpy>=1.19.0
-psutil>=5.7.0
-matplotlib>=3.3.0  # Optional: for visualization if you add that feature
+psutil>=5.7.0  # optional: only used for the total-memory line in system info

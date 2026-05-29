@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# STREAM artifacts produced by setup_stream.sh
+stream.c
+stream_omp
+stream_results.txt
