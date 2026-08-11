@@ -304,11 +304,14 @@ def measure_numpy(op, total_elems, threads, iterations, pin=True):
 _NATIVE_SOURCE = r"""
 #include <stdlib.h>
 #include <stdio.h>
+#include <time.h>      /* clock(), CLOCKS_PER_SEC -- used on the no-OpenMP path */
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
 typedef struct { double *a, *b, *c; long n; } band_state;
+
+void band_free(band_state* s);   /* defined below; band_init needs it to unwind */
 
 static double now(void) {
 #ifdef _OPENMP
@@ -325,7 +328,10 @@ band_state* band_init(long n) {
     s->a = (double*)aligned_alloc(64, (size_t)n * sizeof(double));
     s->b = (double*)aligned_alloc(64, (size_t)n * sizeof(double));
     s->c = (double*)aligned_alloc(64, (size_t)n * sizeof(double));
-    if (!s->a || !s->b || !s->c) { return s; }
+    /* On partial failure free what we got and report failure as NULL. Returning
+       the struct with NULL arrays would pass the caller's "did I get a state?"
+       check and then segfault in band_run. */
+    if (!s->a || !s->b || !s->c) { band_free(s); return NULL; }
     /* Parallel first-touch so pages land on the node that will use them. */
     #pragma omp parallel for
     for (long i = 0; i < n; i++) { s->a[i] = 1.0; s->b[i] = 2.0; s->c[i] = 0.0; }

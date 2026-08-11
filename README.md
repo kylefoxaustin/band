@@ -93,6 +93,12 @@ chmod +x band.py
 
 ### Reading the output
 
+> **The numbers below are ILLUSTRATIVE — they show the shape of the output, not a
+> measurement.** They are not from a recorded run on a known machine, so they are not
+> comparable to your results and must not be cited. Bandwidth figures are meaningless
+> without the CPU, memory configuration and thread count that produced them; when you
+> report your own, report those alongside.
+
 ```
 [Tier 0] NumPy  (achievable from Python)
   Copy   72.51   Scale 97.28   Add 54.72   Triad 70.81  (GB/s, median)
